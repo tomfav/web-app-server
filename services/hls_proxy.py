@@ -1029,7 +1029,9 @@ class HLSProxy:
             try:
                 # Passa il flag force_refresh all'estrattore
                 result = await extractor.extract(
-                    target_url, force_refresh=force_refresh
+                    target_url,
+                    force_refresh=force_refresh,
+                    request_headers=combined_headers,
                 )
                 stream_url = result["destination_url"]
                 stream_headers = result.get("request_headers", {})
@@ -1553,7 +1555,7 @@ class HLSProxy:
             extractor = await self.get_extractor(
                 url, dict(request.headers), host=host_param
             )
-            result = await extractor.extract(url)
+            result = await extractor.extract(url, request_headers=dict(request.headers))
 
             stream_url = result["destination_url"]
             stream_headers = result.get("request_headers", {})

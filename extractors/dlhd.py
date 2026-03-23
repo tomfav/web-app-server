@@ -61,7 +61,8 @@ class DLHDExtractor:
         )
 
         # ✅ Lista host iframe (caricata da cache o vuota)
-        self.iframe_hosts = cache_data.get("hosts", [])
+        cached_hosts = cache_data.get("hosts", [])
+        self.iframe_hosts = cached_hosts if cached_hosts else ["dlhd.so", "dlhd.sx", "daddyhd.com"]
 
         # ✅ Configurazione server dinamica dal worker (usando TEMPLATE completi)
         # Tutti i valori provengono dal worker, i fallback sono solo per il primo avvio
