@@ -63,10 +63,13 @@ docker run -d -p 7860:7860 --name EasyProxy EasyProxy
 git clone https://github.com/stremio-manager/EasyProxy.git
 cd EasyProxy
 pip install -r requirements.txt
+python -m playwright install
 python app.py
 ```
 
 **Server available at:** `http://localhost:7860`
+
+> Note: `pip install -r requirements.txt` installs the Python package for Playwright, but not the browser binaries. If you use browser-assisted extractors, run `python -m playwright install` once after installing dependencies.
 
 ---
 
@@ -145,6 +148,9 @@ cd EasyProxy
 # Install dependencies
 pip install -r requirements.txt
 
+# Install Playwright browsers (required for browser-assisted extractors)
+python -m playwright install
+
 # Start 
 gunicorn --bind 0.0.0.0:7860 --workers 4 --worker-class aiohttp.worker.GunicornWebWorker app:app
 
@@ -162,6 +168,7 @@ cd EasyProxy
 pkg install clang libxml2 libxslt python
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+python -m playwright install
 python app.py
 ```
 
