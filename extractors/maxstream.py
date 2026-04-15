@@ -2,7 +2,8 @@ import logging
 import random
 import re
 import socket
-from urllib.parse import urlparse
+import io
+from urllib.parse import urlparse, quote_plus
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp.resolver import DefaultResolver
 from aiohttp_socks import ProxyConnector
@@ -99,7 +100,7 @@ class MaxstreamExtractor:
             logger.debug(f"DoH resolution failed for {domain}: {e}")
         return []
 
-    async def _smart_request(self, url: str, method="GET", **kwargs):
+    async def _smart_request(self, url: str, method="GET", is_binary=False, **kwargs):
         """Request with automatic retry using different proxies and resolver fallback on connection failure."""
         last_error = None
         parsed_url = urlparse(url)
@@ -143,6 +144,10 @@ class MaxstreamExtractor:
             try:
                 async with session.request(method, url, **kwargs) as response:
                     if response.status < 400:
+                        if is_binary:
+                            content = await response.read()
+                            if proxy: await session.close()
+                            return content
                         text = await response.text()
                         if proxy: await session.close()
                         return text
@@ -160,6 +165,72 @@ class MaxstreamExtractor:
                     await session.close()
         
         raise ExtractorError(f"Connection failed for {url} after trying all paths. Last error: {last_error}")
+
+    async def _solve_uprot_captcha(self, text: str, original_url: str) -> str:
+        """Find, download and solve captcha on uprot page."""
+        try:
+            import ddddocr
+        except ImportError:
+            logger.error("ddddocr not installed. Cannot solve captcha.")
+            return None
+            
+        soup = BeautifulSoup(text, "lxml")
+        img_tag = soup.find("img", src=re.compile(r'/captcha|/image/'))
+        form = soup.find("form")
+        
+        if not img_tag or not form:
+            return None
+            
+        captcha_url = img_tag["src"]
+        if captcha_url.startswith("/"):
+            parsed = urlparse(original_url)
+            captcha_url = f"{parsed.scheme}://{parsed.netloc}{captcha_url}"
+            
+        logger.info(f"Downloading captcha from: {captcha_url}")
+        img_data = await self._smart_request(captcha_url, is_binary=True)
+        
+        if not img_data:
+            return None
+            
+        # Initialize ddddocr (lazy init for performance)
+        if not hasattr(self, '_ocr_engine'):
+            self._ocr_engine = ddddocr.DdddOcr(show_ad=False)
+            
+        # Solve
+        res = self._ocr_engine.classification(img_data)
+        logger.info(f"Captcha solved: {res}")
+        
+        # Submit form
+        form_action = form.get("action", "")
+        if not form_action or form_action == "#":
+            form_action = original_url
+        elif form_action.startswith("/"):
+            parsed = urlparse(original_url)
+            form_action = f"{parsed.scheme}://{parsed.netloc}{form_action}"
+            
+        # Prepare data (find the captcha input name)
+        captcha_input = soup.find("input", {"name": re.compile(r'captcha|code|val', re.I)})
+        if not captcha_input:
+            # Fallback to common names
+            field_name = "captcha"
+        else:
+            field_name = captcha_input["name"]
+            
+        post_data = {field_name: res}
+        # Add other hidden fields
+        for hidden in form.find_all("input", type="hidden"):
+            if hidden.get("name"):
+                post_data[hidden["name"]] = hidden.get("value", "")
+        
+        logger.info(f"Submitting captcha to: {form_action}")
+        headers = {**self.base_headers, "referer": original_url}
+        solved_text = await self._smart_request(form_action, method="POST", data=post_data, headers=headers)
+        
+        # Try to parse the new page
+        try:
+            return self._parse_uprot_html(solved_text)
+        except:
+            return None
 
     def _parse_uprot_html(self, text: str) -> str:
         """Parse uprot HTML to extract redirect link."""
@@ -203,12 +274,7 @@ class MaxstreamExtractor:
         if form and form.get("action") and "uprot" not in form["action"]:
             return form["action"]
             
-        # If we see "Cloudflare" or "Challenge" in text, it's a block
-        if "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
-            raise ExtractorError("Cloudflare block (Browser check/Challenge)")
-            
-        logger.error(f"Uprot Parse Failure. Content: {text[:2000]}...")
-        raise ExtractorError("Redirect link not found in uprot page")
+        return None
 
     async def get_uprot(self, link: str):
         """Extract MaxStream URL from uprot redirect."""
@@ -217,7 +283,24 @@ class MaxstreamExtractor:
         
         # Direct request (user should provide non-datacenter proxy in GLOBAL_PROXY)
         text = await self._smart_request(link)
-        return self._parse_uprot_html(text)
+        
+        # 1. Try normal parse
+        res = self._parse_uprot_html(text)
+        if res:
+            return res
+            
+        # 2. If no link, try puzzle/captcha solver
+        logger.info("Direct link not found, checking for captcha...")
+        res = await self._solve_uprot_captcha(text, link)
+        if res:
+            return res
+            
+        # If we see "Cloudflare" or "Challenge" in text, it's a block
+        if "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
+            raise ExtractorError("Cloudflare block (Browser check/Challenge)")
+            
+        logger.error(f"Uprot Parse Failure. Content: {text[:2000]}...")
+        raise ExtractorError("Redirect link not found in uprot page")
 
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Maxstream URL."""
