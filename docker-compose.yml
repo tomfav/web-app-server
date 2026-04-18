@@ -3,7 +3,7 @@ services:
     build: https://github.com/realbestia1/EasyProxy.git#main
     container_name: easyproxy
     restart: unless-stopped
-    shm_size: "2gb"
+    shm_size: "1gb"
     depends_on:
       - flaresolverr
       - byparr
