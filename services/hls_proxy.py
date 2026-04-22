@@ -345,8 +345,11 @@ class HLSProxy:
         self.flex_session = None
 
         # Registry for HLS URL shortening (to handle extremely long multi-path URLs)
-        # url_id -> actual_url
+        # url_id -> (actual_url, timestamp, ttl)
         self.hls_url_map = {}
+        self.hls_url_ttl = 3600
+        self.hls_url_ttl_cinemacity = 10800
+        self.hls_url_max_entries = 2000
         
         # Cache for proxy sessions (proxy_url -> session)
         # This reuses connections for the same proxy to improve performance
@@ -364,9 +367,30 @@ class HLSProxy:
         """Crea un ID breve per un URL e lo memorizza nella mappa."""
         if not url:
             return ""
+        now = time.time()
+        current_ttl = (
+            self.hls_url_ttl_cinemacity
+            if "cinemacity.cc" in url.lower() or "cccdn.net" in url.lower()
+            else self.hls_url_ttl
+        )
+        expired_keys = [
+            key for key, (_, ts, ttl) in self.hls_url_map.items()
+            if now - ts > ttl
+        ]
+        for key in expired_keys:
+            self.hls_url_map.pop(key, None)
+
+        if len(self.hls_url_map) >= self.hls_url_max_entries:
+            oldest_keys = sorted(
+                self.hls_url_map.items(),
+                key=lambda item: item[1][1]
+            )[: max(1, len(self.hls_url_map) - self.hls_url_max_entries + 1)]
+            for key, _ in oldest_keys:
+                self.hls_url_map.pop(key, None)
+
         # Usa un hash corto (12 caratteri) per l'URL
         url_id = f"u_{hashlib.md5(url.encode()).hexdigest()[:12]}"
-        self.hls_url_map[url_id] = url
+        self.hls_url_map[url_id] = (url, now, current_ttl)
         return url_id
 
     async def start_tasks(self):
@@ -660,6 +684,45 @@ class HLSProxy:
         # Fallback to shared non-proxy session
         session = await self._get_session(prefer_default_family=prefer_default_family)
         return session, None
+
+    async def _retry_cccdn_request(self, request_target, headers, disable_ssl: bool):
+        """Retry cccdn once via an alternate aiohttp route when direct access returns 403."""
+        retry_proxy = None
+        if ENABLE_WARP:
+            retry_proxy = WARP_PROXY_URL
+        elif GLOBAL_PROXIES:
+            retry_proxy = GLOBAL_PROXIES[0]
+
+        if not retry_proxy:
+            return None
+
+        try:
+            connector = get_connector_for_proxy(
+                retry_proxy,
+                limit=0,
+                limit_per_host=0,
+                keepalive_timeout=60,
+                family=socket.AF_INET,
+                rdns=True,
+            )
+            timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
+            async with ClientSession(timeout=timeout, connector=connector) as retry_session:
+                async with retry_session.get(
+                    request_target,
+                    headers=headers,
+                    ssl=not disable_ssl,
+                ) as retry_resp:
+                    if retry_resp.status not in [200, 206]:
+                        return None
+                    return {
+                        "status": retry_resp.status,
+                        "headers": dict(retry_resp.headers),
+                        "body": await retry_resp.read(),
+                        "proxy": retry_proxy,
+                    }
+        except Exception as e:
+            logger.warning("⚠️ cccdn retry via alternate route failed: %r", e)
+            return None
 
     @staticmethod
     def _query_flag_is_true(value: str | None) -> bool:
@@ -1237,8 +1300,12 @@ class HLSProxy:
             # --- Gestione URL brevi (Shortened URLs) ---
             url_id = request.query.get("hls_url_id")
             if url_id and url_id in self.hls_url_map:
-                target_url = self.hls_url_map[url_id]
-                logger.debug(f"🔗 Resolved short URL ID: {url_id}")
+                target_url, stored_at, entry_ttl = self.hls_url_map[url_id]
+                if time.time() - stored_at <= entry_ttl:
+                    logger.debug(f"🔗 Resolved short URL ID: {url_id}")
+                else:
+                    self.hls_url_map.pop(url_id, None)
+                    target_url = None
 
             force_refresh = request.query.get("force", "false").lower() == "true"
             redirect_stream = (
@@ -1358,6 +1425,10 @@ class HLSProxy:
                 original_channel_url = request.query.get("url") or request.query.get("d", "")
                 api_password = request.query.get("api_password")
                 no_bypass = request.query.get("no_bypass") == "1"
+                use_short_hls_urls = (
+                    "cinemacity.cc" in (original_channel_url or "").lower()
+                    or request.query.get("host", "").lower() in {"city", "cinemacity"}
+                )
                 rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
                     manifest_content=captured_manifest,
                     base_url=stream_url,
@@ -1367,7 +1438,7 @@ class HLSProxy:
                     api_password=api_password,
                     get_extractor_func=self.get_extractor,
                     no_bypass=no_bypass,
-                    shorten_url_func=None,
+                    shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None,
                 )
                 return web.Response(
                     text=rewritten_manifest,
@@ -2454,7 +2525,6 @@ class HLSProxy:
                     # cccdn.net multi-path URLs MUST have literal commas.
                     final_curl_url = stream_url
                     if "cccdn.net" in final_curl_url:
-                        import urllib.parse
                         final_curl_url = urllib.parse.unquote(final_curl_url)
 
                     # ✅ NUOVO: Se è un manifest, proviamo a usare smart_request come fallback
@@ -2526,13 +2596,34 @@ class HLSProxy:
                 goto_manifest_processing = False
 
             if not goto_manifest_processing:
-                final_url = yarl.URL(stream_url, encoded=True)
-                resp_ctx = session.get(final_url, headers=headers, ssl=not disable_ssl)
+                if is_cccdn_stream:
+                    request_target = urllib.parse.unquote(stream_url)
+                else:
+                    request_target = yarl.URL(stream_url, encoded=True)
+                resp_ctx = session.get(request_target, headers=headers, ssl=not disable_ssl)
 
             async with resp_ctx as resp:
                 content_type = resp.headers.get("content-type", "").lower()
 
                 if resp.status not in [200, 206]:
+                    if is_cccdn_stream and resp.status == 403 and not goto_manifest_processing:
+                        retry_result = await self._retry_cccdn_request(
+                            request_target,
+                            headers,
+                            disable_ssl,
+                        )
+                        if retry_result:
+                            retry_headers = dict(retry_result["headers"])
+                            retry_headers["Access-Control-Allow-Origin"] = "*"
+                            logger.info(
+                                "✅ cccdn retry success via alternate route: %s",
+                                retry_result["proxy"],
+                            )
+                            return web.Response(
+                                body=retry_result["body"],
+                                status=retry_result["status"],
+                                headers=retry_headers,
+                            )
                     error_body = await resp.read()
                     routing = "WARP" if session_proxy == WARP_PROXY_URL else ("BYPASS" if session_proxy is None else "PROXY")
                     logger.warning(f"⚠️ Upstream returned error {resp.status} for {stream_url} [Routing: {routing}]")
@@ -2585,6 +2676,11 @@ class HLSProxy:
                     host = request.headers.get("X-Forwarded-Host", request.host)
                     proxy_base = f"{scheme}://{host}"
                     original_url = request.query.get("url") or request.query.get("d", "")
+                    use_short_hls_urls = (
+                        "cinemacity.cc" in (original_url or "").lower()
+                        or request.query.get("host", "").lower() in {"city", "cinemacity"}
+                        or "cccdn.net" in str(resp.url).lower()
+                    )
                     
                     rewritten = await ManifestRewriter.rewrite_manifest_urls(
                         manifest_content=manifest_content,
@@ -2595,11 +2691,10 @@ class HLSProxy:
                         api_password=request.query.get("api_password"),
                         get_extractor_func=self.get_extractor,
                         no_bypass=request.query.get("no_bypass") == "1",
-                        shorten_url_func=None
+                        shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None
                     )
                     return web.Response(text=rewritten, headers={
                         "Content-Type": "application/vnd.apple.mpegurl",
-                        "Content-Disposition": 'attachment; filename="stream.m3u8"',
                         "Access-Control-Allow-Origin": "*",
                         "Cache-Control": "no-cache",
                     })
@@ -2687,7 +2782,6 @@ class HLSProxy:
                                 text=hls_playlist,
                                 headers={
                                     "Content-Type": "application/vnd.apple.mpegurl",
-                                    "Content-Disposition": 'attachment; filename="stream.m3u8"',
                                     "Access-Control-Allow-Origin": "*",
                                     "Cache-Control": "no-cache",
                                 },
