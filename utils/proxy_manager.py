@@ -14,7 +14,7 @@ class FreeProxyManager:
     _instances: Dict[str, 'FreeProxyManager'] = {}
     _lock = threading.Lock()
 
-    def __init__(self, name: str, list_urls: List[str], cache_ttl: int = 1800, max_fetch: int = 0, max_good: int = 0):
+    def __init__(self, name: str, list_urls: List[str], cache_ttl: int = 7200, max_fetch: int = 0, max_good: int = 0):
         self.name = name
         self.list_urls = list_urls if isinstance(list_urls, list) else [list_urls]
         self.cache_ttl = cache_ttl
@@ -29,6 +29,7 @@ class FreeProxyManager:
     def get_instance(cls, name: str, list_urls: List[str], **kwargs) -> 'FreeProxyManager':
         with cls._lock:
             if name not in cls._instances:
+                kwargs.setdefault("cache_ttl", int(os.environ.get("VIXSRC_FREE_PROXY_CACHE_TTL", "7200")))
                 cls._instances[name] = cls(name, list_urls, **kwargs)
             return cls._instances[name]
 
@@ -151,3 +152,12 @@ class FreeProxyManager:
         self.cursor = (idx + 1) % len(proxies)
         
         return proxies[idx:] + proxies[:idx]
+
+    def report_failure(self, proxy_url: str):
+        """Rimuove un proxy dalla cache se viene segnalato come non funzionante."""
+        if proxy_url in self.proxies:
+            try:
+                self.proxies.remove(proxy_url)
+                logger.warning(f"ProxyManager[{self.name}]: Proxy {proxy_url} removed from cache after reported failure.")
+            except ValueError:
+                pass

@@ -48,7 +48,7 @@ class VixSrcExtractor:
                 ),
                 "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
             ],
-            cache_ttl=int(os.environ.get("VIXSRC_FREE_PROXY_CACHE_TTL", "1800")),
+            cache_ttl=int(os.environ.get("VIXSRC_FREE_PROXY_CACHE_TTL", "7200")),
             max_fetch=_FREE_PROXY_MAX_FETCH,
             max_good=_FREE_PROXY_MAX_GOOD,
         )
@@ -266,6 +266,7 @@ class VixSrcExtractor:
                                 return MockResponse(content, response.status, response.headers, response.url)
                         except Exception as proxy_exc:
                             logger.warning("VixSrc: auto proxy %s failed: %s", proxy_url, proxy_exc)
+                            self.proxy_manager.report_failure(proxy_url)
                         finally:
                             if temp_session and temp_session is not self.session and not temp_session.closed:
                                 await temp_session.close()

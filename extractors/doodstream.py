@@ -51,7 +51,7 @@ class DoodStreamExtractor:
                 ),
                 "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
             ],
-            cache_ttl=int(os.environ.get("DOOD_FREE_PROXY_CACHE_TTL", "1800")),
+            cache_ttl=int(os.environ.get("DOOD_FREE_PROXY_CACHE_TTL", "7200")),
             max_fetch=_FREE_PROXY_MAX_FETCH,
             max_good=_FREE_PROXY_MAX_GOOD,
         )
@@ -235,12 +235,16 @@ class DoodStreamExtractor:
 
             for proxy_url in await self._get_auto_proxy_pool(embed_url):
                 logger.info(f"DoodStream: retrying with auto proxy {proxy_url}")
-                result = await self._do_extract_with_proxy(
-                    embed_url,
-                    {"http": proxy_url, "https": proxy_url},
-                )
-                if result:
-                    return result
+                try:
+                    result = await self._do_extract_with_proxy(
+                        embed_url,
+                        {"http": proxy_url, "https": proxy_url},
+                    )
+                    if result:
+                        return result
+                except Exception as proxy_exc:
+                    logger.warning(f"DoodStream: auto proxy {proxy_url} failed: {proxy_exc}")
+                    self.proxy_manager.report_failure(proxy_url)
 
             raise ExtractorError("DoodStream: tokens not found after primary and auto-proxy attempts")
         except Exception as e:
