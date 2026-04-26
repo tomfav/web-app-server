@@ -219,7 +219,30 @@ class DeltabitExtractor:
                     
                     logger.debug(f"Deltabit: OCR Result (sanitized): {res_captcha}")
                     
-                    post_data = urlencode({"captch5": res_captcha, "submit": "Continue"})
+                    # Dynamic form fields extraction
+                    form = soup.find("form")
+                    post_fields = {}
+                    if form:
+                        for inp in form.find_all("input"):
+                            name = inp.get("name")
+                            val = inp.get("value", "")
+                            if name:
+                                post_fields[name] = val
+                    
+                    # Override or add captcha code
+                    if "code" in post_fields or soup.find("input", {"name": "code"}):
+                        post_fields["code"] = res_captcha
+                    elif "captch5" in post_fields or soup.find("input", {"name": "captch5"}):
+                        post_fields["captch5"] = res_captcha
+                    else:
+                        post_fields["code"] = res_captcha
+                        
+                    if "submit" not in post_fields:
+                        post_fields["submit"] = "Continue"
+                    
+                    post_data = urlencode(post_fields)
+                    logger.debug(f"Deltabit: Posting captcha with data: {post_data}")
+                    
                     post_res = await self._request_flaresolverr("request.post", current_url, post_data, session_id=session_id)
                     post_solution = post_res.get("solution", {})
                     text = post_solution.get("response", "")
@@ -238,16 +261,15 @@ class DeltabitExtractor:
 
                 next_url = None
                 for attempt in range(3):
-                    for a_tag in soup.find_all("a", href=True):
+                    for a_tag in soup.find_all(["a", "button"], href=True) or soup.find_all(["a", "button"]):
                         txt = a_tag.get_text().lower()
-                        href = a_tag["href"]
-                        if any(x in txt for x in ["proceed to video", "continue", "guarda il video"]):
-                            next_url = href
+                        href = a_tag.get("href")
+                        if any(x in txt for x in ["proceed", "continue", "prosegui", "avanti", "click here", "clicca qui", "vai al video", "guarda il video"]):
+                            if a_tag.name == "a" and href:
+                                next_url = href
+                            elif a_tag.name == "button" and a_tag.parent.name == "a":
+                                next_url = a_tag.parent.get("href")
                             break
-                        for btn in a_tag.find_all("button"):
-                            if "proceed" in btn.get_text().lower():
-                                 next_url = href
-                                 break
                         if next_url: break
                     
                     if not next_url:

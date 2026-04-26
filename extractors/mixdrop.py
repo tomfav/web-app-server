@@ -140,8 +140,15 @@ class MixdropExtractor(BaseExtractor):
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Mixdrop URL."""
         # 1. Handle redirectors (safego.cc, clicka.cc, etc.)
-        if any(domain in url.lower() for domain in ["safego.cc", "clicka.cc", "clicka"]):
-            url = await self._solve_redirector(url)
+        max_redirects = 5
+        redirect_count = 0
+        while any(domain in url.lower() for domain in ["safego.cc", "clicka.cc", "clicka", "safelink"]) and redirect_count < max_redirects:
+            logger.info("Mixdrop: solving redirector %s (attempt %s)", url, redirect_count + 1)
+            new_url = await self._solve_redirector(url)
+            if new_url == url:
+                break
+            url = new_url
+            redirect_count += 1
 
         # 2. Normalize
         if "/f/" in url: url = url.replace("/f/", "/e/")
@@ -291,36 +298,71 @@ class MixdropExtractor(BaseExtractor):
                 img_data = base64.b64decode(img_tag["src"].split(",")[1])
                 ocr = ddddocr.DdddOcr(show_ad=False)
                 captcha = ocr.classification(img_data)
-                post_data = urlencode({"captch5": captcha, "submit": "Continue"})
+                # Normalize common OCR errors
+                captcha = captcha.replace('o', '0').replace('O', '0').replace('l', '1').replace('I', '1')
+                captcha = re.sub(r'[^0-9]', '', captcha)
+                logger.info("Mixdrop: Decoded captcha (normalized): %s", captcha)
+                
+                # Dynamic form fields extraction
+                form = soup.find("form")
+                post_fields = {}
+                if form:
+                    for inp in form.find_all("input"):
+                        name = inp.get("name")
+                        val = inp.get("value", "")
+                        if name:
+                            post_fields[name] = val
+                
+                # Override or add captcha code
+                # On safego.cc, the field name is 'code' but the id is 'captch5'
+                if "code" in post_fields or soup.find("input", {"name": "code"}):
+                    post_fields["code"] = captcha
+                elif "captch5" in post_fields or soup.find("input", {"name": "captch5"}):
+                    post_fields["captch5"] = captcha
+                else:
+                    post_fields["code"] = captcha # Fallback
+                
+                if "submit" not in post_fields:
+                    post_fields["submit"] = "Continue"
+                
+                post_data = urlencode(post_fields)
+                logger.debug("Mixdrop: Posting captcha with data: %s", post_data)
                 
                 pres = await self._request_flaresolverr("request.post", current_url, post_data, session_id=session_id)
                 if pres:
                     text = pres.get("solution", {}).get("response", "")
+                    current_url = pres.get("solution", {}).get("url", current_url)
                     soup = BeautifulSoup(text, "lxml")
 
             for attempt in range(4):
                 proceed_link = None
-                for a_tag in soup.find_all("a", href=True):
+                # Check for links or buttons with specific text
+                for a_tag in soup.find_all(["a", "button"], href=True) or soup.find_all(["a", "button"]):
                     txt = a_tag.get_text().lower()
-                    if "proceed to video" in txt or "continue" in txt:
-                        proceed_link = a_tag
+                    if any(x in txt for x in ["proceed", "continue", "prosegui", "avanti", "click here", "clicca qui", "vai al video"]):
+                        if a_tag.name == "a" and a_tag.get("href"):
+                            proceed_link = a_tag
+                        elif a_tag.name == "button" and a_tag.parent.name == "a":
+                            proceed_link = a_tag.parent
                         break
-                    for btn in a_tag.find_all("button"):
-                        if "proceed" in btn.get_text().lower():
-                             proceed_link = a_tag
-                             break
-                    if proceed_link: break
                 
                 if not proceed_link:
-                    proceed_link = soup.find("a", href=re.compile(r'deltabit|mixdrop|clicka', re.I))
+                    # Look for links containing keywords
+                    proceed_link = soup.find("a", href=re.compile(r'deltabit|mixdrop|clicka|safego|safelink', re.I))
                 
                 if proceed_link:
-                    return urljoin(current_url, proceed_link["href"])
+                    resolved_url = urljoin(current_url, proceed_link["href"])
+                    if resolved_url != current_url:
+                        return resolved_url
                 
+                # Check for meta refresh
                 meta = soup.find("meta", attrs={"http-equiv": re.compile(r'refresh', re.I)})
                 if meta and "url=" in meta.get("content", "").lower():
                     r_url = re.search(r'url=(.*)', meta["content"], re.I).group(1).strip()
-                    if r_url: return urljoin(current_url, r_url)
+                    if r_url: 
+                        resolved_url = urljoin(current_url, r_url)
+                        if resolved_url != current_url:
+                            return resolved_url
 
                 if attempt < 3:
                     await asyncio.sleep(4)
