@@ -22,6 +22,7 @@ async def smart_request(
     post_data: Optional[str] = None,
     proxies: Optional[list] = None,
     bypass_warp: bool = None,
+    wait: int = 0,
 ) -> Any:
     """
     Effettua una richiesta intelligente: prova la via diretta, poi curl_cffi, e se fallisce usa FlareSolverr.
@@ -142,10 +143,9 @@ async def smart_request(
     if fs_cookies: payload["cookies"] = fs_cookies
     if post_data: payload["postData"] = post_data
     
-    # Add wait parameter if specified in kwargs
-    wait_time = kwargs.get("wait", 0)
-    if wait_time > 0:
-        payload["wait"] = wait_time
+    # Add wait parameter if specified
+    if wait > 0:
+        payload["wait"] = wait
     if proxy:
         payload["proxy"] = {"url": proxy}
         headers_for_fs = {"X-Proxy-Server": get_solver_proxy_url(proxy)}
