@@ -7,6 +7,7 @@ import os
 from urllib.parse import urlparse, urljoin, urlencode
 
 import aiohttp
+from aiohttp import ClientSession, TCPConnector
 from bs4 import BeautifulSoup, SoupStrainer
 from aiohttp_socks import ProxyConnector
 
@@ -139,15 +140,16 @@ class MixdropExtractor:
                     sol = fs_res.get("solution", {})
                     return sol.get("response", ""), sol.get("url", target_url), {c["name"]: c["value"] for c in sol.get("cookies", [])}
                 else:
-                    async with await self._get_session(proxy=p) as session:
+                    connector = get_connector_for_proxy(p) if p else TCPConnector(ssl=False)
+                    async with ClientSession(connector=connector, headers=self.base_headers) as local_session:
                         if post_data:
-                            async with session.post(target_url, data=post_data, cookies=cookies, headers=request_headers, timeout=12) as r:
+                            async with local_session.post(target_url, data=post_data, cookies=cookies, headers=request_headers, timeout=12) as r:
                                 if r.status == 200:
                                     text = await r.text()
                                     if not any(m in text.lower() for m in ["cf-challenge", "ray id", "checking your browser"]):
                                         return text, str(r.url), {k: v.value for k, v in r.cookies.items()}
                         else:
-                            async with session.get(target_url, cookies=cookies, headers=request_headers, timeout=12) as r:
+                            async with local_session.get(target_url, cookies=cookies, headers=request_headers, timeout=12) as r:
                                 if r.status == 200:
                                     text = await r.text()
                                     if not any(m in text.lower() for m in ["cf-challenge", "ray id", "checking your browser"]):
@@ -251,8 +253,9 @@ class MixdropExtractor:
                     
                     async def fetch_direct():
                         try:
-                            async with await self._get_session(proxy=pref_p) as session:
-                                async with session.get(mirror_url, cookies=cookies, headers=m_headers, timeout=10) as r:
+                            connector = get_connector_for_proxy(pref_p) if pref_p else TCPConnector(ssl=False)
+                            async with ClientSession(connector=connector, headers=self.base_headers) as local_session:
+                                async with local_session.get(mirror_url, cookies=cookies, headers=m_headers, timeout=10) as r:
                                     if r.status == 200:
                                         t = await r.text()
                                         if not any(m in t.lower() for m in ["cf-challenge", "robot", "checking your browser"]):
