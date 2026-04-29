@@ -1,0 +1,23 @@
+name: Sync Daily
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # Si aggiorna tutti i giorni alle 4:00 di notte
+  workflow_dispatch: # Ti permette di farlo a mano se vuoi, cliccando un bottone
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          ref: main # Lascia "main", a meno che il progetto usi "master"
+
+      - name: Sync Upstream
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: Realbestia1/Easyproxy
+          upstream_sync_branch: main
+          target_sync_branch: main
+          git_push_args: --force
