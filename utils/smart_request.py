@@ -122,7 +122,6 @@ async def smart_request(
                     {
                         "name": k,
                         "value": v,
-                        "domain": cookie_domain,
                         "path": "/",
                         "secure": cookie_secure,
                     }
