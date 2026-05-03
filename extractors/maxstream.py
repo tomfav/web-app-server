@@ -63,6 +63,7 @@ class MaxstreamExtractor:
         self.mediaflow_endpoint = "hls_proxy"
         self.proxies = proxies or []
         self.cookies = {} # Persistent cookies for the session
+        self.selected_proxy = None
         self.resolver = StaticResolver()
         self.proxy_manager = FreeProxyManager.get_instance(
             "maxstream",
@@ -298,6 +299,7 @@ class MaxstreamExtractor:
                         
                         async with session.request(method, url, ssl=False, **call_kwargs) as response:
                             if response.status < 400:
+                                self.selected_proxy = proxy
                                 if is_binary:
                                     return await response.read()
                                 text = await response.text()
@@ -691,6 +693,7 @@ class MaxstreamExtractor:
                 "destination_url": direct_match.group(1),
                 "request_headers": {**self.base_headers, "referer": maxstream_url},
                 "mediaflow_endpoint": self.mediaflow_endpoint,
+                "selected_proxy": self.selected_proxy,
             }
 
         # Fallback to packer logic
@@ -752,6 +755,7 @@ class MaxstreamExtractor:
             "destination_url": final_url,
             "request_headers": self.base_headers,
             "mediaflow_endpoint": self.mediaflow_endpoint,
+            "selected_proxy": self.selected_proxy,
         }
 
     async def close(self):
