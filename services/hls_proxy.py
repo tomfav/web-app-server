@@ -1188,7 +1188,7 @@ class HLSProxy:
             ):
                 key = "dlstreams_direct" if bypass_warp else "dlstreams"
                 proxy = get_proxy_for_url(
-                    "dlhd.dad", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
+                    url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
