@@ -678,23 +678,60 @@ class VixSrcExtractor:
             if response.status_code != 200:
                 raise ExtractorError("URL component extraction failed, invalid request")
 
-            script_content = await self._parse_html_simple(response.text, "script")
-            if not script_content:
-                raise ExtractorError("No script found in body")
+            async def _extract_from_html(html: str) -> str | None:
+                """Try to extract playlist URL from HTML via script content, then data-page JSON."""
+                script = await self._parse_html_simple(html, "script")
+                if script:
+                    try:
+                        return self._extract_playlist_from_embed(script)
+                    except ExtractorError:
+                        pass
+                app_div = await self._parse_html_simple(html, "div", {"id": "app"})
+                if not app_div or not app_div.get("data-page"):
+                    return None
+                try:
+                    data_page = app_div["data-page"].replace("&quot;", '"')
+                    data = json.loads(data_page)
+                    def _search_json(obj):
+                        results = {}
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                kl = k.lower()
+                                if kl in ("token", "expires", "url", "src") and isinstance(v, str):
+                                    results[kl] = v
+                                elif not (results.get("token") and results.get("expires") and results.get("url")):
+                                    results.update(_search_json(v))
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                results.update(_search_json(item))
+                                if results.get("token") and results.get("expires") and results.get("url"):
+                                    break
+                        return results
+                    found = _search_json(data)
+                    if found.get("token") and found.get("expires") and found.get("url"):
+                        parsed_url = urlparse(found["url"])
+                        query_params = parse_qsl(parsed_url.query, keep_blank_values=True)
+                        query_params.extend([("token", found["token"]), ("expires", found["expires"])])
+                        if "canPlayFHD" in html:
+                            query_params.append(("h", "1"))
+                        query_params.append(("lang", "it"))
+                        return urlunparse(parsed_url._replace(query=urlencode(query_params)))
+                except (json.JSONDecodeError, Exception):
+                    pass
+                return None
 
-            try:
-                final_url = self._extract_playlist_from_embed(script_content)
-                stream_headers = self._fresh_headers(Referer=url)
+            final_url = await _extract_from_html(response.text)
+            if not final_url:
+                raise ExtractorError("No playlist data found in response (script or data-page)")
 
-                logger.info("VixSrc URL extracted successfully: %s", final_url)
-                return {
-                    "destination_url": final_url,
-                    "request_headers": stream_headers,
-                    "mediaflow_endpoint": self.mediaflow_endpoint,
-                    "selected_proxy": self.last_used_proxy,
-                }
-            except Exception as e:
-                raise ExtractorError(f"JavaScript script parsing error: {e}")
+            stream_headers = self._fresh_headers(Referer=url)
+            logger.info("VixSrc URL extracted successfully: %s", final_url)
+            return {
+                "destination_url": final_url,
+                "request_headers": stream_headers,
+                "mediaflow_endpoint": self.mediaflow_endpoint,
+                "selected_proxy": self.last_used_proxy,
+            }
 
         except Exception as e:
             logger.error("VixSrc extraction failed: %s", str(e))
