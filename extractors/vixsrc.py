@@ -518,22 +518,25 @@ class VixSrcExtractor:
             if "/embed/" in parsed_url.path:
                 self._raise_if_embed_expired(url)
                 if parsed_url.netloc.lower().endswith("vixcloud.co"):
+                    # Rewrite vixcloud.co → vixsrc.to to bypass Cloudflare
+                    vix_url = url.replace("vixcloud.co", "vixsrc.to")
+                    logger.info("Rewrote URL to vixsrc.to: %s", vix_url)
                     try:
                         response = await self._make_robust_request(
-                            url,
+                            vix_url,
                             headers=self._fresh_headers(
-                                referer=self._normalize_base_site(url) + "/"
+                                referer=vix_url
                             ),
                         )
                     except Exception as robust_err:
-                        logger.warning("Robust request failed for vixcloud.co, trying curl_cffi: %s", robust_err)
+                        logger.warning("Robust request failed for vixsrc.to, trying curl_cffi: %s", robust_err)
                         try:
                             response = await self._make_curl_request(
-                                url,
-                                headers={"referer": self._normalize_base_site(url) + "/"},
+                                vix_url,
+                                headers={"referer": vix_url},
                             )
                         except Exception as curl_err:
-                            logger.warning("curl_cffi failed for vixcloud.co, no more fallbacks: %s", curl_err)
+                            logger.warning("curl_cffi failed for vixsrc.to, no more fallbacks: %s", curl_err)
                 else:
                     response = await self._make_robust_request(
                         url,
@@ -624,7 +627,11 @@ class VixSrcExtractor:
             if not final_url:
                 raise ExtractorError("No playlist data found in response")
 
-            stream_headers = self._fresh_headers(Referer=url)
+            # Rewrite vixcloud.co → vixsrc.to in the final URL too
+            final_url = final_url.replace("vixcloud.co", "vixsrc.to")
+            stream_url = url.replace("vixcloud.co", "vixsrc.to")
+
+            stream_headers = self._fresh_headers(Referer=stream_url)
             logger.info("VixSrc URL extracted successfully: %s", final_url)
             return {
                 "destination_url": final_url,
