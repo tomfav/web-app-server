@@ -151,14 +151,7 @@ def get_proxy_for_url(url: str, transport_routes: list, global_proxies: list, by
                     return None
                 return proxy_value if is_proxy_alive(proxy_value) else None
 
-    # Check if WARP should be used
-    is_excluded = any(domain in normalized_url for domain in WARP_EXCLUDE_DOMAINS)
-    
-    if ENABLE_WARP and not bypass_warp and not is_excluded:
-        return WARP_PROXY_URL if is_proxy_alive(WARP_PROXY_URL) else None
-
-    # Fallback to Global Proxies. warp=off disables only WARP, not configured proxies.
-    # Use sticky proxy if already selected for this request context
+    # Explicit GLOBAL_PROXY wins over WARP. warp=off disables only WARP, not configured proxies.
     proxy = SELECTED_PROXY_CONTEXT.get()
     if proxy:
         return proxy if is_proxy_alive(proxy) else None
@@ -166,7 +159,16 @@ def get_proxy_for_url(url: str, transport_routes: list, global_proxies: list, by
     proxy = random.choice(global_proxies) if global_proxies else None
     if proxy:
         SELECTED_PROXY_CONTEXT.set(proxy)
-        
+
+    if proxy:
+        return proxy if is_proxy_alive(proxy) else None
+
+    # Check if WARP should be used only when no explicit proxy is configured.
+    is_excluded = any(domain in normalized_url for domain in WARP_EXCLUDE_DOMAINS)
+
+    if ENABLE_WARP and not bypass_warp and not is_excluded:
+        return WARP_PROXY_URL if is_proxy_alive(WARP_PROXY_URL) else None
+
     return proxy if is_proxy_alive(proxy) else None
 
 
