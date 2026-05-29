@@ -20,6 +20,11 @@ class HLSProxyManifestHandlerMixin:
         token = BYPASS_WARP_CONTEXT.set(bypass_warp)
         proxy_token = SELECTED_PROXY_CONTEXT.set(None)
         selected_proxy = None
+        raw_proxy = request.query.get("proxy")
+        if raw_proxy:
+            selected_proxy = urllib.parse.unquote(raw_proxy)
+            if "://" not in selected_proxy and "%3a" in selected_proxy.lower():
+                selected_proxy = urllib.parse.unquote(selected_proxy)
 
         try:
             extractor = None
