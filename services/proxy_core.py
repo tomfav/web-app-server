@@ -303,22 +303,10 @@ class HLSProxyCoreMixin:
         asyncio.create_task(self._cleanup_stale_sessions())
 
     async def _cleanup_stale_sessions(self):
-        """Periodically close proxy sessions and extractors unused for >30s."""
+        """Periodically close stale extractors unused for >30s."""
         while True:
             await asyncio.sleep(60)
             now = time.time()
-            # Stale proxy sessions
-            stale = [
-                p for p, t in self._proxy_session_atimes.items()
-                if now - t > 30 and p in self.proxy_sessions
-            ]
-            for proxy in stale:
-                session = self.proxy_sessions.pop(proxy, None)
-                self._proxy_session_atimes.pop(proxy, None)
-                if session and not session.closed:
-                    await session.close()
-                    logger.info("🧹 Cleaned stale proxy session: %s", proxy)
-            # Stale extractors
             stale_ext = [
                 k for k, t in self._extractor_atimes.items()
                 if now - t > 30 and k in self.extractors
