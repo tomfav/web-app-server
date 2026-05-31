@@ -44,23 +44,20 @@ async def ensure_flaresolverr() -> bool:
 
     Returns True se FlareSolverr è attivo e raggiungibile.
     """
-    global _flaresolverr_process, _flaresolverr_starting
+    global _flaresolverr_process, _flaresolverr_starting, _flaresolverr_last_used
 
     if not FLARESOLVERR_URL:
         return False
 
     async with _flaresolverr_lock:
         if _flaresolverr_starting:
+            _flaresolverr_last_used = time.time()
             return True
         if await _is_flaresolverr_alive():
             _flaresolverr_last_used = time.time()
             return True
         if _flaresolverr_process and _flaresolverr_process.returncode is None:
-            return True
-        # Controlla se già in esecuzione
-        if await _is_flaresolverr_alive():
-            return True
-        if _flaresolverr_process and _flaresolverr_process.returncode is None:
+            _flaresolverr_last_used = time.time()
             return True
 
         script = await _find_flaresolverr_script()
@@ -113,11 +110,11 @@ async def _is_flaresolverr_alive() -> bool:
 
 
 async def try_shutdown_idle_flaresolverr():
-    """Ferma FlareSolverr se inattivo da >5 minuti."""
+    """Ferma FlareSolverr se inattivo oltre il timeout configurato."""
     global _flaresolverr_process
     if _flaresolverr_process and _flaresolverr_process.returncode is None:
         if time.time() - _flaresolverr_last_used > _FLARESOLVERR_IDLE_TIMEOUT:
-            logger.info("FlareSolverr idle >5min, shutting down")
+            logger.info("FlareSolverr idle >%ss, shutting down", _FLARESOLVERR_IDLE_TIMEOUT)
             await shutdown_flaresolverr()
 
 async def shutdown_flaresolverr():
