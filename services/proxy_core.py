@@ -1,4 +1,5 @@
 from services.proxy_shared import *
+from utils.solver_manager import try_shutdown_idle_flaresolverr
 
 class HLSProxyCoreMixin:
 
@@ -320,6 +321,7 @@ class HLSProxyCoreMixin:
                     except Exception:
                         pass
                 logger.info("🧹 Cleaned stale extractor: %s", key)
+            await try_shutdown_idle_flaresolverr()
 
     async def _update_warp_status_loop(self):
         """Periodically checks WARP status via Cloudflare trace (Universal)."""

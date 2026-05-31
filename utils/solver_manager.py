@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 import aiohttp
 
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 _flaresolverr_process: asyncio.subprocess.Process | None = None
 _flaresolverr_starting = False
 _flaresolverr_lock = asyncio.Lock()
+_flaresolverr_last_used: float = 0.0
+_FLARESOLVERR_IDLE_TIMEOUT = 60  # secondi prima di spegnere FlareSolverr inutilizzato
 
 
 async def _find_flaresolverr_script() -> str | None:
@@ -48,7 +51,11 @@ async def ensure_flaresolverr() -> bool:
 
     async with _flaresolverr_lock:
         if _flaresolverr_starting:
-            # Già in fase di avvio da un'altra coroutine
+            return True
+        if await _is_flaresolverr_alive():
+            _flaresolverr_last_used = time.time()
+            return True
+        if _flaresolverr_process and _flaresolverr_process.returncode is None:
             return True
         # Controlla se già in esecuzione
         if await _is_flaresolverr_alive():
@@ -82,6 +89,7 @@ async def ensure_flaresolverr() -> bool:
                 return False
             if await _is_flaresolverr_alive():
                 logger.info("FlareSolverr is ready")
+                _flaresolverr_last_used = time.time()
                 return True
 
         logger.warning("FlareSolverr failed to start within 30s")
@@ -103,6 +111,14 @@ async def _is_flaresolverr_alive() -> bool:
     except Exception:
         return False
 
+
+async def try_shutdown_idle_flaresolverr():
+    """Ferma FlareSolverr se inattivo da >5 minuti."""
+    global _flaresolverr_process
+    if _flaresolverr_process and _flaresolverr_process.returncode is None:
+        if time.time() - _flaresolverr_last_used > _FLARESOLVERR_IDLE_TIMEOUT:
+            logger.info("FlareSolverr idle >5min, shutting down")
+            await shutdown_flaresolverr()
 
 async def shutdown_flaresolverr():
     """Ferma FlareSolverr se avviato da noi."""
