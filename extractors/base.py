@@ -1,19 +1,18 @@
 import logging
 import asyncio
-import random
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, ClientConnectionError
 from aiohttp_socks import ProxyError as AioProxyError
 from python_socks import ProxyError as PyProxyError
 
 from config import (
-    get_proxy_for_url, 
-    TRANSPORT_ROUTES, 
     get_connector_for_proxy,
     SELECTED_PROXY_CONTEXT,
-    GLOBAL_PROXIES,
-    mark_proxy_dead
+    STRICT_PROXY_CONTEXT,
+    mark_proxy_dead,
+    get_preferred_proxy_for_url,
 )
+import config as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -30,20 +29,24 @@ class BaseExtractor:
         }
         self.session = None
         self.mediaflow_endpoint = "hls_proxy"
-        self.proxies = proxies or GLOBAL_PROXIES
+        self.proxies = proxies or []
         self.extractor_name = extractor_name
+        self._session_proxy = None
         
 
     async def _get_session(self, url: str = None):
-        if self.session is None or self.session.closed:
+        proxy = await get_preferred_proxy_for_url(url, self.extractor_name, self.proxies or _cfg.GLOBAL_PROXIES)
+
+        if (
+            self.session is None
+            or self.session.closed
+            or self._session_proxy != proxy
+        ):
+            if self.session and not self.session.closed:
+                await self.session.close()
+
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            
-            proxy = None
-            if url:
-                proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
-            elif self.proxies:
-                proxy = random.choice(self.proxies)
-                
+
             if proxy:
                 connector = get_connector_for_proxy(proxy)
             else:
@@ -60,6 +63,7 @@ class BaseExtractor:
                 connector=connector, 
                 headers={'User-Agent': self.base_headers["User-Agent"]}
             )
+            self._session_proxy = proxy
         return self.session
 
     async def _make_request(self, url: str, method: str = "GET", headers: dict = None, retries: int = 2, **kwargs):
@@ -74,9 +78,9 @@ class BaseExtractor:
                 async with session.request(method, url, headers=final_headers, allow_redirects=True, **kwargs) as response:
                     response.raise_for_status()
                     
-                    # ✅ NUOVO: Protezione contro file binari giganti
                     content_type = response.headers.get("Content-Type", "").lower()
-                    content_length = int(response.headers.get("Content-Length", 0))
+                    content_length_str = response.headers.get("Content-Length", "0")
+                    content_length = int(content_length_str) if content_length_str.isdigit() else 0
                     
                     if "video/" in content_type or "audio/" in content_type or content_length > 2 * 1024 * 1024:
                         logger.warning(f"[{self.extractor_name}] Skipping text read for binary/large content: {content_type} ({content_length} bytes)")
@@ -115,9 +119,9 @@ class BaseExtractor:
                     await self.session.close()
                 self.session = None
                 
-                if is_proxy_err and SELECTED_PROXY_CONTEXT.get():
+                if is_proxy_err and SELECTED_PROXY_CONTEXT.get() and not STRICT_PROXY_CONTEXT.get():
                     proxy_to_mark = SELECTED_PROXY_CONTEXT.get()
-                    if proxy_to_mark and "127.0.0.1" in proxy_to_mark:
+                    if proxy_to_mark:
                         mark_proxy_dead(proxy_to_mark)
                     SELECTED_PROXY_CONTEXT.set(None)
                 

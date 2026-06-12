@@ -8,7 +8,7 @@ import time
 from urllib.parse import urljoin, urlparse
 
 import cloudscraper
-from config import GLOBAL_PROXIES, TRANSPORT_ROUTES, get_proxy_for_url
+from config import get_preferred_proxy_for_url
 from utils.cookie_cache import CookieCache
 
 logger = logging.getLogger(__name__)
@@ -36,22 +36,22 @@ class DoodStreamExtractor:
         self.last_used_proxy = None
         self.mediaflow_endpoint = "proxy_stream_endpoint"
         self.cache = CookieCache("dood")
-    def _get_proxy(self, url: str, bypass_warp: bool = None) -> str | None:
-        return get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
+    async def _get_proxy(self, url: str, bypass_warp: bool = None) -> str | None:
+        return await get_preferred_proxy_for_url(url, "doodstream", self.proxies, bypass_warp)
 
     def _normalize_proxy_url(self, proxy_value: str) -> str:
         proxy_value = proxy_value.strip()
         if proxy_value.startswith("socks5://"):
             return proxy_value.replace("socks5://", "socks5h://", 1)
+        if proxy_value.startswith("socks4://") or proxy_value.startswith("socks4a://"):
+            return proxy_value
         if "://" not in proxy_value:
             return f"socks5h://{proxy_value}"
         return proxy_value
 
-    def _build_scraper_proxies(self, url: str, proxy_url: str | None = None, bypass_warp: bool = None) -> dict | None:
-        if not proxy_url and self.proxies:
-            proxy_url = self.proxies[0]
+    async def _build_scraper_proxies(self, url: str, proxy_url: str | None = None, bypass_warp: bool = None) -> dict | None:
         if not proxy_url:
-            proxy_url = self._get_proxy(url, bypass_warp=bypass_warp)
+            proxy_url = await self._get_proxy(url, bypass_warp=bypass_warp)
         if not proxy_url:
             return None
         proxy_url = self._normalize_proxy_url(proxy_url)
@@ -195,23 +195,12 @@ class DoodStreamExtractor:
             # 1. First attempt: Use default proxy (WARP if enabled) or user-specified bypass_warp
             result = await self._do_extract_with_proxy(
                 embed_url,
-                self._build_scraper_proxies(embed_url, bypass_warp=bypass_warp),
+                await self._build_scraper_proxies(embed_url, bypass_warp=bypass_warp),
             )
             if result:
                 return result
 
-            # 2. Fallback: If first attempt failed and we haven't tried bypassing WARP yet, try direct connection
-            if not bypass_warp:
-                logger.info(f"DoodStream: first attempt failed, retrying with warp=off (direct) for {embed_url}")
-                result = await self._do_extract_with_proxy(
-                    embed_url,
-                    self._build_scraper_proxies(embed_url, bypass_warp=True),
-                )
-                if result:
-                    result["bypass_warp"] = True  # Signal to the proxy to keep using direct for segments
-                    return result
-
-            raise ExtractorError("DoodStream: tokens not found after primary attempts")
+            raise ExtractorError("DoodStream: tokens not found after primary attempt")
 
         except Exception as e:
             logger.error(f"DoodStream: cloudscraper error: {e}")

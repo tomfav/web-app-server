@@ -8,7 +8,8 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyConnector
 from typing import Optional, Dict, Any
 from urllib.parse import quote_plus
-from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy
+from config import get_connector_for_proxy, get_preferred_proxy_for_url
+import config as _cfg
 import random
 
 logger = logging.getLogger(__name__)
@@ -35,28 +36,34 @@ class VavooExtractor:
         }
         self.session = None
         self.mediaflow_endpoint = "proxy_stream_endpoint"
-        self.proxies = proxies or GLOBAL_PROXIES
+        self.proxies = proxies or _cfg.GLOBAL_PROXIES
         self._cached_sig = None
         self._cached_sig_ts = 0
+        self._session_proxy = None
 
     def _get_random_proxy(self):
         """Restituisce un proxy casuale dalla lista."""
         return random.choice(self.proxies) if self.proxies else None
         
     async def _get_session(self, url: str = None):
-        if self.session is None or self.session.closed:
+        # Determina il proxy per l'URL (se fornito)
+        proxy = await get_preferred_proxy_for_url(url, "vavoo", self.proxies)
+        if not proxy and not url:
+            proxy = self._get_random_proxy()
+
+        if (
+            self.session is None
+            or self.session.closed
+            or self._session_proxy != proxy
+        ):
+            if self.session and not self.session.closed:
+                await self.session.close()
+
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            
-            # Determina il proxy per l'URL (se fornito)
-            proxy = None
-            if url:
-                proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
-            else:
-                proxy = self._get_random_proxy()
-                
+
             if proxy:
                 logger.debug(f"Using proxy for Vavoo session: {proxy}")
-                connector = get_connector_for_proxy(proxy)
+                connector = get_connector_for_proxy(proxy, family=socket.AF_INET)
             else:
                 connector = TCPConnector(
                     limit=0,
@@ -73,6 +80,7 @@ class VavooExtractor:
                 connector=connector,
                 headers={'User-Agent': self.base_headers["user-agent"]}
             )
+            self._session_proxy = proxy
         return self.session
 
     async def _get_auth_signature(self) -> Optional[str]:
@@ -125,7 +133,7 @@ class VavooExtractor:
 
         for attempt in range(3):
             try:
-                async with session.post(_LOKKE_PING_URL, json=body, headers=headers, timeout=ClientTimeout(total=10)) as resp:
+                async with session.post(_LOKKE_PING_URL, json=body, headers=headers, timeout=ClientTimeout(total=10), ssl=False) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         sig = data.get("addonSig")
@@ -148,7 +156,8 @@ class VavooExtractor:
                     _TS_PING2_URL,
                     data={"vec": _TS_VEC},
                     headers={"content-type": "application/x-www-form-urlencoded"},
-                    timeout=ClientTimeout(total=10)
+                    timeout=ClientTimeout(total=10),
+                    ssl=False
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -177,7 +186,7 @@ class VavooExtractor:
             "clientVersion": "3.0.2",
         }
         try:
-            async with session.post(_RESOLVE_URL, json=body, headers=headers, timeout=ClientTimeout(total=12)) as resp:
+            async with session.post(_RESOLVE_URL, json=body, headers=headers, timeout=ClientTimeout(total=12), ssl=False) as resp:
                 if resp.status != 200:
                     logger.warning(f"Resolve returned status {resp.status}")
                     return None
