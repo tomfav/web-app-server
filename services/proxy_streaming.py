@@ -493,7 +493,8 @@ class HLSProxyStreamingMixin:
                         async def __aexit__(self, exc_type, exc_val, exc_tb): pass
 
                     if curl_resp.status_code in [502, 503, 504]:
-                        logger.warning(f"⚠️ [curl_cffi] {curl_resp.status_code} error for {final_curl_url[:50]}, falling back to standard aiohttp...")
+                        # curl_only: 503 = live offline. Non cascare MAI ad aiohttp.
+                        logger.warning(f"⚠️ [curl_cffi] {curl_resp.status_code} for {final_curl_url[:50]}: live offline o upstream errato")
                         goto_manifest_processing = False
                     else:
                         resp_ctx = MockResp(curl_resp)
@@ -505,16 +506,25 @@ class HLSProxyStreamingMixin:
                 goto_manifest_processing = False
 
             if not goto_manifest_processing:
-                if is_special_cdn:
-                    request_target = urllib.parse.unquote(stream_url)
+                _extractor_key = request.query.get("extractor_key", "")
+                _extractor = self.extractors.get(_extractor_key) if _extractor_key else None
+                _curl_only = getattr(_extractor, 'curl_only', False) if _extractor else False
+                if _curl_only and use_curl_cffi:
+                    # CDN backend funziona solo via curl_cffi (es. embedst). 
+                    # Mai aiohttp: dà 403 spurio o disconnessione TLS.
+                    logger.debug("curl_only: no aiohttp fallback, returning error directly")
+                    resp_ctx = None
                 else:
-                    request_target = yarl.URL(stream_url, encoded=True)
-                resp_ctx = session.get(
-                    request_target,
-                    headers=headers,
-                    ssl=not disable_ssl,
-                    timeout=segment_timeout if is_hls_segment_request else None,
-                )
+                    if is_special_cdn:
+                        request_target = urllib.parse.unquote(stream_url)
+                    else:
+                        request_target = yarl.URL(stream_url, encoded=True)
+                    resp_ctx = session.get(
+                        request_target,
+                        headers=headers,
+                        ssl=not disable_ssl,
+                        timeout=segment_timeout if is_hls_segment_request else None,
+                    )
 
             async def retry_with_different_proxy():
                 if forced_proxy or not session_proxy:
@@ -589,6 +599,15 @@ class HLSProxyStreamingMixin:
                             exc,
                         )
                 return None
+
+            if resp_ctx is None:
+                # curl_only (embedst): curl_cffi fallito, live offline → return 503 subito
+                logger.debug("curl_only: upstream offline, returning 503")
+                return web.Response(
+                    status=503,
+                    text="Stream offline",
+                    headers={"Access-Control-Allow-Origin": "*", "Content-Type": "text/plain; charset=utf-8"},
+                )
 
             async with resp_ctx as resp:
                 content_type = resp.headers.get("content-type", "").lower()

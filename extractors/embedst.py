@@ -27,6 +27,8 @@ class EmbedStExtractor(BaseExtractor):
     with --experimental-vm-modules (embed.st uses dynamic ESM import()).
     """
 
+    curl_only = True
+
     def __init__(self, request_headers: dict, proxies: list = None, bypass_warp: bool = False):
         super().__init__(request_headers, proxies, extractor_name="embedst")
         self.bypass_warp_active = bypass_warp
