@@ -466,11 +466,35 @@ class HLSProxyCoreMixin:
         except Exception as e:
             logging.error(f"❌ Error in dynamic WARP bypass: {e}")
 
+class SharedSessionWrapper:
+    def __init__(self, session):
+        object.__setattr__(self, "_session", session)
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._session, name, value)
+
+    @property
+    def closed(self) -> bool:
+        return self._session.closed
+
+    async def close(self):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
     async def _get_proxy_session(self, url: str, bypass_warp: bool = False, forced_proxy: str | None = None):
-        """Create a fresh session for the given URL.
+        """Create a fresh session or reuse an existing one for the given URL.
 
         Returns: (session, proxy_url) tuple
-        - session: The aiohttp ClientSession to use
+        - session: The aiohttp ClientSession (wrapped) to use
         - proxy_url: The proxy URL being used, or None for direct connection
         """
         await self._check_dynamic_warp_bypass(url)
@@ -485,21 +509,34 @@ class HLSProxyCoreMixin:
         prefer_default_family = prefer_default_family_for_url(url)
 
         if proxy:
-            logger.info(f"[NET] Creating proxy session: {proxy}")
-            try:
-                connector = get_connector_for_proxy(
-                    proxy,
-                    limit=0,
-                    limit_per_host=0,
-                    keepalive_timeout=60,
-                    family=socket.AF_INET,
-                )
-                timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=30)
-                session = ClientSession(timeout=timeout, connector=connector)
-                return session, proxy
-            except Exception as e:
-                logger.warning(f"Failed to create proxy connector: {e}")
-                raise
+            if not hasattr(self, "_proxy_sessions"):
+                self._proxy_sessions = {}
+
+            # Clean up closed sessions from cache
+            for p_url, p_sess in list(self._proxy_sessions.items()):
+                if p_sess.closed:
+                    self._proxy_sessions.pop(p_url, None)
+
+            if proxy not in self._proxy_sessions or self._proxy_sessions[proxy].closed:
+                logger.info(f"[NET] Creating pooled proxy session: {proxy}")
+                try:
+                    connector = get_connector_for_proxy(
+                        proxy,
+                        limit=0,
+                        limit_per_host=0,
+                        keepalive_timeout=60,
+                        family=socket.AF_INET,
+                    )
+                    timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=30)
+                    session = ClientSession(timeout=timeout, connector=connector)
+                    self._proxy_sessions[proxy] = session
+                except Exception as e:
+                    logger.warning(f"Failed to create proxy connector: {e}")
+                    raise
+            else:
+                session = self._proxy_sessions[proxy]
+
+            return SharedSessionWrapper(session), proxy
 
         session = await self._get_session(prefer_default_family=prefer_default_family)
         return session, None
@@ -648,6 +685,12 @@ class HLSProxyCoreMixin:
                 await self.session.close()
             if self.flex_session and not self.flex_session.closed:
                 await self.flex_session.close()
+
+            if hasattr(self, "_proxy_sessions"):
+                for p_sess in list(self._proxy_sessions.values()):
+                    if not p_sess.closed:
+                        await p_sess.close()
+                self._proxy_sessions.clear()
 
             for extractor in self.extractors.values():
                 if hasattr(extractor, "close"):
