@@ -5,9 +5,8 @@ import socket
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse, parse_qs
-from config import get_connector_for_proxy, get_preferred_proxy_for_url
+from config import get_connector_for_proxy
 import config as _cfg
-import random
 
 logger = logging.getLogger(__name__)
 
@@ -30,48 +29,38 @@ class VavooExtractor:
         self._session_lock = asyncio.Lock()
         self.mediaflow_endpoint = "proxy_stream_endpoint"
         self.proxies = proxies or _cfg.GLOBAL_PROXIES
-        self._session_proxy = None
+        self._proxy = None  # scelto una volta, non cambia
 
-    def _get_random_proxy(self):
-        """Restituisce un proxy casuale dalla lista."""
-        return random.choice(self.proxies) if self.proxies else None
-        
-    async def _get_session(self, url: str = None):
+    async def _get_session(self):
         async with self._session_lock:
-            proxy = await get_preferred_proxy_for_url(url, "vavoo", self.proxies)
-            if not proxy and not url:
-                proxy = self._get_random_proxy()
+            if self.session is not None and not self.session.closed:
+                return self.session
 
-            if (
-                self.session is None
-                or self.session.closed
-                or self._session_proxy != proxy
-            ):
-                if self.session and not self.session.closed:
-                    await self.session.close()
+            if self._proxy is None and self.proxies:
+                import random
+                self._proxy = random.choice(self.proxies)
 
-                timeout = ClientTimeout(total=60, connect=30, sock_read=30)
+            timeout = ClientTimeout(total=60, connect=30, sock_read=30)
 
-                if proxy:
-                    logger.debug(f"Using proxy for Vavoo session: {proxy}")
-                    connector = get_connector_for_proxy(proxy, family=socket.AF_INET)
-                else:
-                    connector = TCPConnector(
-                        limit=0,
-                        limit_per_host=0,
-                        keepalive_timeout=60,
-                        enable_cleanup_closed=True,
-                        force_close=False,
-                        use_dns_cache=True,
-                        family=socket.AF_INET
-                    )
-
-                self.session = ClientSession(
-                    timeout=timeout,
-                    connector=connector,
-                    headers={'User-Agent': self.base_headers["user-agent"]}
+            if self._proxy:
+                logger.debug(f"Using proxy for Vavoo session: {self._proxy}")
+                connector = get_connector_for_proxy(self._proxy, family=socket.AF_INET)
+            else:
+                connector = TCPConnector(
+                    limit=0,
+                    limit_per_host=0,
+                    keepalive_timeout=60,
+                    enable_cleanup_closed=True,
+                    force_close=False,
+                    use_dns_cache=True,
+                    family=socket.AF_INET
                 )
-                self._session_proxy = proxy
+
+            self.session = ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={'User-Agent': self.base_headers["user-agent"]}
+            )
         return self.session
 
     async def _resolve_via_mediahubmx(self, url: str) -> Optional[str]:
@@ -88,7 +77,7 @@ class VavooExtractor:
         if m:
             url = f"https://vavoo.to/vavoo-iptv/play/{m.group(1)}"
 
-        session = await self._get_session(_RESOLVE_URL)
+        session = await self._get_session()
         headers = {
             "Origin": "https://vavoo.to",
             "Referer": "https://vavoo.to/",
@@ -138,5 +127,7 @@ class VavooExtractor:
         }
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        async with self._session_lock:
+            if self.session and not self.session.closed:
+                await self.session.close()
+            self.session = None
