@@ -186,10 +186,13 @@ class FFmpegManager:
         logger.debug(f"FFmpeg command for {stream_id}: {cmd}")
         
         log_file = open(os.path.join(stream_dir, "ffmpeg.log"), "w")
-        log_file.write(f"Command: {cmd}\n\n")
-        log_file.flush()
         process = None
         success = False
+        try:
+            log_file.write(f"Command: {cmd}\n\n")
+            log_file.flush()
+        except Exception:
+            pass
         try:
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -201,7 +204,6 @@ class FFmpegManager:
                 self.processes[stream_id] = process
                 self.active_streams[stream_id] = url
                 
-                # Wait for the playlist to appear (up to 30 seconds) using asyncio.Event
                 playlist_ready = asyncio.Event()
 
                 async def _wait_for_playlist():

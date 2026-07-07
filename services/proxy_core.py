@@ -512,6 +512,18 @@ class HLSProxyCoreMixin:
             if forced_proxy.lower() == "off":
                 forced_proxy = None
 
+        # Stale proxy sessions cleanup (>60s idle, aligned with connector keepalive_timeout)
+        # WARP session is excluded — never closed automatically.
+        if hasattr(self, "_proxy_session_atimes"):
+            now = time.time()
+            _warp_url = _shared.WARP_PROXY_URL
+            stale = [p for p, t in self._proxy_session_atimes.items() if now - t > 60 and p != _warp_url]
+            for p_url in stale:
+                p_sess = self._proxy_sessions.pop(p_url, None)
+                self._proxy_session_atimes.pop(p_url, None)
+                if p_sess and not p_sess.closed:
+                    await p_sess.close()
+
         proxy = forced_proxy or get_proxy_for_url(url, bypass_warp=bypass_warp)
 
         prefer_default_family = prefer_default_family_for_url(url)
@@ -519,11 +531,12 @@ class HLSProxyCoreMixin:
         if proxy:
             if not hasattr(self, "_proxy_sessions"):
                 self._proxy_sessions = {}
+                self._proxy_session_atimes = {}
 
-            # Clean up closed sessions from cache
             for p_url, p_sess in list(self._proxy_sessions.items()):
                 if p_sess.closed:
                     self._proxy_sessions.pop(p_url, None)
+                    self._proxy_session_atimes.pop(p_url, None)
 
             if proxy not in self._proxy_sessions or self._proxy_sessions[proxy].closed:
                 logger.info(f"[NET] Creating pooled proxy session: {proxy}")
@@ -544,6 +557,7 @@ class HLSProxyCoreMixin:
             else:
                 session = self._proxy_sessions[proxy]
 
+            self._proxy_session_atimes[proxy] = time.time()
             return SharedSessionWrapper(session), proxy
 
         session = await self._get_session(prefer_default_family=prefer_default_family)
@@ -699,6 +713,8 @@ class HLSProxyCoreMixin:
                     if not p_sess.closed:
                         await p_sess.close()
                 self._proxy_sessions.clear()
+                if hasattr(self, "_proxy_session_atimes"):
+                    self._proxy_session_atimes.clear()
 
             for extractor in self.extractors.values():
                 if hasattr(extractor, "close"):

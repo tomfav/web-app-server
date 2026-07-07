@@ -581,23 +581,21 @@ class HLSProxyStreamingMixin:
 
             if use_curl_cffi:
                 logger.info(f"🚀 [curl_cffi] Using browser impersonation for: {stream_url}")
+                curl_s = None
                 try:
                     curl_s = CurlAsyncSession(impersonate="chrome124")
                     curl_headers = prepare_curl_headers(stream_url, headers)
 
 
                     curl_proxies = None
-                    # ✅ DEBUG: Log final headers for comparison
                     logger.debug(f"🚀 [curl_cffi] Sending headers for {stream_url[:50]}: {curl_headers}")
 
                     curl_proxies = None
                     if session_proxy:
                         curl_proxies = {"http": session_proxy, "https": session_proxy}
 
-                    # ✅ CRITICAL FIX: Ensure commas are NOT encoded.
                     final_curl_url = final_curl_request_url(stream_url)
 
-                    # se curl_cffi diretto dovesse dare ancora 403.
                     curl_resp = await curl_s.get(
                         final_curl_url,
                         headers=curl_headers,
@@ -613,35 +611,43 @@ class HLSProxyStreamingMixin:
                             async for chunk in self.c_resp.aiter_content():
                                 yield chunk
                         async def read(self, n=-1):
-                            # curl_cffi's acontent() returns the full body and ignores size.
-                            # Match aiohttp's content.read(n) signature so error-path callers
-                            # (e.g. resp.content.read(4096)) don't raise TypeError.
                             return await self.c_resp.acontent()
 
                     class MockResp:
-                        def __init__(self, c_resp):
+                        def __init__(self, c_resp, curl_session=None):
                             self.status = c_resp.status_code
                             self.headers = c_resp.headers
                             self.url = yarl.URL(c_resp.url)
                             self.content = MockContent(c_resp)
+                            self._curl_session = curl_session
                         async def read(self): return await self.content.read()
                         async def text(self, errors='replace'):
                             content = await self.read()
                             return content.decode('utf-8', errors=errors)
-                        async def close(self): pass
+                        async def close(self):
+                            if self._curl_session:
+                                await self._curl_session.close()
+                                self._curl_session = None
                         async def __aenter__(self): return self
-                        async def __aexit__(self, exc_type, exc_val, exc_tb): pass
+                        async def __aexit__(self, exc_type, exc_val, exc_tb):
+                            await self.close()
 
                     if curl_resp.status_code in [502, 503, 504]:
-                        # curl_only: 503 = live offline. Non cascare MAI ad aiohttp.
                         logger.warning(f"⚠️ [curl_cffi] {curl_resp.status_code} for {final_curl_url[:50]}: live offline o upstream errato")
                         goto_manifest_processing = False
                     else:
-                        resp_ctx = MockResp(curl_resp)
+                        resp_ctx = MockResp(curl_resp, curl_s)
+                        curl_s = None
                         goto_manifest_processing = True
                 except Exception as e:
                     logger.error(f"❌ [curl_cffi] Error: {e}")
                     goto_manifest_processing = False
+                finally:
+                    if curl_s:
+                        try:
+                            await curl_s.close()
+                        except Exception:
+                            pass
             else:
                 goto_manifest_processing = False
 
