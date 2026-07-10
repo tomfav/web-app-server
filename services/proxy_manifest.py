@@ -622,6 +622,8 @@ class HLSProxyManifestHandlerMixin:
             SELECTED_PROXY_CONTEXT.reset(proxy_token)
             STRICT_PROXY_CONTEXT.reset(strict_proxy_token)
             # 🚫 Cache disabilitata: chiudi sempre l'estrattore dopo l'uso.
+            if extractor_key is None and extractor is not None:
+                extractor_key = self._extractor_key_for_instance(extractor)
             if extractor_key and extractor_key in self.extractors:
                 self.extractors.pop(extractor_key, None)
                 self._extractor_atimes.pop(extractor_key, None)

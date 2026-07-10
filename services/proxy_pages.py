@@ -17,6 +17,7 @@ from services.proxy_shared import (
 )
 from extractors.registry import *
 import config_store
+import config as _config
 from config import reload_config, clear_proxy_affinity, get_system_stats
 
 class HLSProxyPagesMixin:
@@ -242,6 +243,8 @@ class HLSProxyPagesMixin:
         # Refresh version on API call
         await self._refresh_latest_version()
 
+        stats = get_system_stats()
+
         info = {
             "proxy": "EasyProxy",
             "version": APP_VERSION,  # Aggiornata per supporto AES-128
@@ -256,6 +259,20 @@ class HLSProxyPagesMixin:
                 "✅ CORS enabled",
             ],
             "extractors_loaded": list(self.extractors.keys()),
+            "diagnostics": {
+                "extractors_cached": len(self.extractors),
+                "cdn_tokens": len(getattr(self, '_renewed_cdn_tokens', {})),
+                "proxy_sessions_cached": len(getattr(self, '_proxy_sessions', {})),
+                "active_stream_sessions": len(_shared.ACTIVE_STREAM_SESSIONS),
+                "bypassed_warp_domains": len(_shared.BYPASSED_WARP_DOMAINS),
+                "template_cache": len(getattr(self, '_template_cache', {})),
+                "dead_proxies": len(getattr(_config, 'DEAD_PROXIES', {})),
+                "shared_session_active": bool(self.session and not self.session.closed),
+                "flex_session_active": bool(getattr(self, 'flex_session', None) and not self.flex_session.closed),
+                "session_idle_seconds": round(time.time() - getattr(self, '_session_atime', 0), 1) if getattr(self, '_session_atime', 0) else None,
+                "connection_count": sum(len(v) for v in self.session._connector._conns.values()) if self.session and not self.session.closed and hasattr(self.session, '_connector') and hasattr(self.session._connector, '_conns') else 0,
+            },
+            "memory": stats.get("proxy_ram", {}),
             "modules": {
                 "playlist_builder": PlaylistBuilder is not None,
                 "vavoo_extractor": VavooExtractor is not None,
