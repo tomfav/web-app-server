@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import hmac
 import logging
 import os
@@ -122,10 +123,32 @@ class HLSProxyCoreMixin:
                         await self.flex_session.close()
                         logger.info("[NET] Closed idle flex session (idle %.0fs)", now - _session_atime)
                     self.flex_session = None
+
+                # 4. Compact Windows heap to release freed pages
+                await self._compact_heap()
+
             except Exception as e:
                 logger.error("Cleanup stale sessions error: %s", e)
                 await asyncio.sleep(10)
 
+    async def _compact_heap(self):
+        """Release freed heap pages back to the OS (Linux: malloc_trim, Windows: HeapCompact)."""
+        try:
+            gc.collect()
+            import ctypes
+            import platform
+            if platform.system() == "Windows":
+                ctypes.windll.kernel32.HeapCompact(
+                    ctypes.windll.kernel32.GetProcessHeap(), 0
+                )
+            else:
+                try:
+                    libc = ctypes.CDLL("libc.so.6")
+                    libc.malloc_trim(0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
     async def _warp_keepalive(self):
@@ -310,30 +333,30 @@ class HLSProxyCoreMixin:
     async def _refresh_latest_version(self):
         """Checks GitHub config.py for the latest version with cache busting.
         Can be called on-demand (e.g. on page refresh).
+        Uses its own temporary session to avoid resetting the shared session idle timer.
         """
         try:
-            # Use a timestamp to bypass GitHub's cache
             cache_buster = int(time.time())
             url = f"https://raw.githubusercontent.com/realbestia1/EasyProxy/main/config.py?t={cache_buster}"
 
-            # Use a direct session with a short timeout to not block UI too long
-            session = await self._get_session()
-            async with session.get(url, timeout=2) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    # Use regex to find APP_VERSION = "..." or '...'
-                    match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
-                    if match:
-                        new_version = match.group(1)
-                        if self.latest_version != new_version:
-                            self.latest_version = new_version
-                            logger.info(f"🆕 Latest version updated: {self.latest_version}")
+            connector = TCPConnector(limit=1, limit_per_host=1, keepalive_timeout=5)
+            timeout = ClientTimeout(total=5)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+                        if match:
+                            new_version = match.group(1)
+                            if self.latest_version != new_version:
+                                self.latest_version = new_version
+                                logger.info(f"🆕 Latest version updated: {self.latest_version}")
+                        else:
+                            if self.latest_version == "Checking...":
+                                self.latest_version = "Unknown"
                     else:
                         if self.latest_version == "Checking...":
-                            self.latest_version = "Unknown"
-                else:
-                    if self.latest_version == "Checking...":
-                        self.latest_version = "Error"
+                            self.latest_version = "Error"
         except Exception as e:
             if self.latest_version == "Checking...":
                 self.latest_version = "Unknown"
