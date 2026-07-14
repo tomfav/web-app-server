@@ -378,7 +378,7 @@ class HLSProxyExtractorHandlerMixin:
                     "expired",
                     "no longer available",
                 ]
-            ) or isinstance(e, (asyncio.TimeoutError, asyncio.CancelledError))
+            ) or isinstance(e, (asyncio.TimeoutError, asyncio.CancelledError)) or type(e).__name__ == "ExtractorError"  # ponytail: expected extractor failures shouldn't print a traceback
 
             error_desc = str(e) or type(e).__name__
             if isinstance(e, asyncio.CancelledError):
