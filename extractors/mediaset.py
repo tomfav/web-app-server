@@ -189,6 +189,48 @@ class MediasetExtractor(BaseExtractor):
             json_body={"contentId": guid, "streamType": "VOD"},
         )
         playback_error = playback.get("error") or {}
+        if str(playback_error.get("code") or "").upper() == "PL053":
+            try:
+                retry_client_id = str(uuid.uuid4())
+                retry_login = await self._json_request(
+                    "POST",
+                    LOGIN_URL,
+                    headers={
+                        "Origin": MEDIASET_ORIGIN,
+                        "Referer": f"{MEDIASET_ORIGIN}/",
+                    },
+                    json_body={
+                        "client_id": retry_client_id,
+                        "appName": "web//mediasetplay-web/1.3.0",
+                    },
+                )
+                retry_response = retry_login.get("response", {})
+                retry_bearer = str(retry_response.get("beToken") or "")
+                if retry_bearer:
+                    retry_playback = await self._json_request(
+                        "POST",
+                        PLAYBACK_URL,
+                        headers={
+                            "Authorization": f"Bearer {retry_bearer}",
+                            "X-M-Device-Id": retry_client_id,
+                            "X-M-Platform": "WEB",
+                            "X-M-Property": "MPLAY",
+                            "X-M-Sid": str(
+                                retry_response.get("sid") or retry_client_id
+                            ),
+                            "X-M-App-Version": "1.1.1",
+                            "Origin": MEDIASET_ORIGIN,
+                            "Referer": f"{MEDIASET_ORIGIN}/",
+                        },
+                        json_body={"contentId": guid, "streamType": "VOD"},
+                    )
+                    if not retry_playback.get("error"):
+                        playback = retry_playback
+                        bearer = retry_bearer
+            except Exception:
+                pass
+
+        playback_error = playback.get("error") or {}
         if playback_error:
             raise RuntimeError(
                 f"{playback_error.get('code') or 'PLAYBACK'}: "
