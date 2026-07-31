@@ -1,5 +1,7 @@
+import asyncio
 import html
 import json
+import logging
 import re
 import urllib.parse
 import uuid
@@ -7,9 +9,17 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import aiohttp
+import config as _config
+from config import (
+    ALL_PROXY_ERRORS,
+    SELECTED_PROXY_CONTEXT,
+    STRICT_PROXY_CONTEXT,
+)
 from extractors.base import BaseExtractor, ExtractorError
 from extractors.widevine import extract_widevine_pssh, resolve_widevine_device
 
+
+logger = logging.getLogger(__name__)
 
 WITTY_ORIGIN = "https://www.wittytv.it"
 MEDIASET_ORIGIN = "https://mediasetinfinity.mediaset.it"
@@ -144,7 +154,45 @@ class MediasetExtractor(BaseExtractor):
         try:
             resolved = await self._resolve_playback(url)
         except Exception as error:
-            raise ExtractorError(f"Mediaset extraction failed: {error}") from error
+            network_errors = ALL_PROXY_ERRORS + (
+                asyncio.TimeoutError,
+                aiohttp.ClientConnectionError,
+                aiohttp.ServerDisconnectedError,
+            )
+            can_retry_warp = (
+                isinstance(error, network_errors)
+                and self._session_proxy == _config.WARP_PROXY_URL
+            )
+            if not can_retry_warp:
+                detail = str(error) or type(error).__name__
+                raise ExtractorError(
+                    f"Mediaset extraction failed: {detail}"
+                ) from error
+
+            logger.warning(
+                "Mediaset extraction via WARP failed with %r; "
+                "retrying through a fresh WARP session",
+                error,
+            )
+            if self.session and not self.session.closed:
+                await self.session.close()
+            self.session = None
+            self._session_proxy = None
+
+            selected_proxy_token = SELECTED_PROXY_CONTEXT.set(
+                _config.WARP_PROXY_URL
+            )
+            strict_proxy_token = STRICT_PROXY_CONTEXT.set(True)
+            try:
+                resolved = await self._resolve_playback(url)
+            except Exception as retry_error:
+                detail = str(retry_error) or type(retry_error).__name__
+                raise ExtractorError(
+                    f"Mediaset extraction failed after WARP retry: {detail}"
+                ) from retry_error
+            finally:
+                STRICT_PROXY_CONTEXT.reset(strict_proxy_token)
+                SELECTED_PROXY_CONTEXT.reset(selected_proxy_token)
 
         clearkey = ",".join(
             f"{kid}:{key}" for kid, key in resolved["keys"].items()
