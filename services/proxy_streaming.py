@@ -1149,6 +1149,17 @@ class HLSProxyStreamingMixin:
                     asyncio.create_task(self.reconnect_warp())
                 else:
                     logger.debug("WARP proxy is healthy; stream failure was due to upstream source.")
+            if "CERTIFICATE_VERIFY_FAILED" in str(e) or "SSL" in str(e) or "ssl" in str(e):
+                try:
+                    host = urllib.parse.urlparse(stream_url).netloc.split(":")[0]
+                    parts = host.split(".")
+                    base_domain = ".".join(parts[-2:]) if len(parts) >= 2 else host
+                except Exception:
+                    base_domain = "target domain"
+                logger.warning(
+                    f"💡 SSL Certificate error for {stream_url}. "
+                    f"Consider adding domain '{base_domain}' to Transport Routes with 'disable_ssl': true or using parameter 'disable_ssl=1'."
+                )
             logger.warning(f"⚠️ Connection lost with source: {stream_url} ({str(e)})")
             return web.Response(text=f"Upstream connection lost: {str(e)}", status=502)
 
