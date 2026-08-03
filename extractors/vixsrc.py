@@ -261,7 +261,7 @@ class VixSrcExtractor:
             raise ExtractorError("Invalid VixSrc URL")
         netloc = parsed.netloc
         if any(d in netloc.lower() for d in ("vixcloud.co", "vixsrc.to")):
-            netloc = "cromosino.space"
+            netloc = "komiknostalgia.id"
         return f"{parsed.scheme}://{netloc}"
 
     def _get_random_proxy(self):
@@ -605,7 +605,7 @@ class VixSrcExtractor:
                 if asn_match and asn_match.group(1):
                     query_params.append(("asn", asn_match.group(1)))
                 res_url = urlunparse(parsed_playlist_url._replace(query=urlencode(query_params)))
-                return res_url.replace("vixcloud.co", "cromosino.space").replace("vixsrc.to", "cromosino.space")
+                return res_url.replace("vixcloud.co", "komiknostalgia.id").replace("vixsrc.to", "komiknostalgia.id")
 
         token_match = re.search(r"['\"]token['\"]\s*:\s*['\"](\w+)['\"]", script_content)
         expires_match = re.search(r"['\"]expires['\"]\s*:\s*['\"](\d+)['\"]", script_content)
@@ -641,7 +641,7 @@ class VixSrcExtractor:
             query_params.append(("asn", asn_match.group(1)))
 
         res_url = urlunparse(parsed_server_url._replace(query=urlencode(query_params)))
-        return res_url.replace("vixcloud.co", "cromosino.space").replace("vixsrc.to", "cromosino.space")
+        return res_url.replace("vixcloud.co", "komiknostalgia.id").replace("vixsrc.to", "komiknostalgia.id")
 
     async def version(self, site_url: str, forced_proxy: str | None = None) -> str:
         """Ottiene la versione del sito VixSrc parent."""
@@ -696,7 +696,7 @@ class VixSrcExtractor:
                 if req_h.get("User-Agent"):
                     stream_headers["User-Agent"] = req_h["User-Agent"]
 
-                clean_dest = url.replace("vixcloud.co", "cromosino.space").replace("vixsrc.to", "cromosino.space")
+                clean_dest = url.replace("vixcloud.co", "komiknostalgia.id").replace("vixsrc.to", "komiknostalgia.id")
                 return {
                     "destination_url": clean_dest,
                     "request_headers": stream_headers,
@@ -731,7 +731,7 @@ class VixSrcExtractor:
 
                 iframe_data = await self._parse_html_simple(response.text, "iframe")
                 if iframe_data and iframe_data.get("src"):
-                    iframe_url = iframe_data["src"].replace("&amp;", "&").replace("vixcloud.co", "cromosino.space").replace("vixsrc.to", "cromosino.space")
+                    iframe_url = iframe_data["src"].replace("&amp;", "&").replace("vixcloud.co", "komiknostalgia.id").replace("vixsrc.to", "komiknostalgia.id")
                     response = await self._make_robust_request(
                         iframe_url,
                         headers=self._fresh_headers(
@@ -822,8 +822,8 @@ class VixSrcExtractor:
             if not final_url:
                 raise ExtractorError("No playlist data found in response")
 
-            clean_destination = final_url.replace("vixcloud.co", "cromosino.space").replace("vixsrc.to", "cromosino.space")
-            clean_referer = url.replace("vixcloud.co", "cromosino.space").replace("vixsrc.to", "cromosino.space")
+            clean_destination = final_url.replace("vixcloud.co", "komiknostalgia.id").replace("vixsrc.to", "komiknostalgia.id")
+            clean_referer = url.replace("vixcloud.co", "komiknostalgia.id").replace("vixsrc.to", "komiknostalgia.id")
 
             stream_headers = self._fresh_headers(Referer=clean_referer)
 
