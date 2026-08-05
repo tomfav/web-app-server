@@ -16,7 +16,7 @@ import config as _cfg
 
 logger = logging.getLogger(__name__)
 
-VIXSRC_CONFIG_URL = "https://raw.githubusercontent.com/realbestia1/EasyProxy/main/domains.json"
+VIXSRC_CONFIG_URL = "https://raw.githubusercontent.com/realbestia1/damains/refs/heads/main/damains.json"
 _vixsrc_domain = None
 _vixsrc_config_loaded_at = 0.0
 
@@ -70,7 +70,7 @@ class VixSrcExtractor:
     @staticmethod
     def _replace_vixsrc_domain(url: str) -> str:
         if not _vixsrc_domain:
-            raise ExtractorError("VixSrc domain config unavailable")
+            return url
         return url.replace("vixcloud.co", _vixsrc_domain).replace("vixsrc.to", _vixsrc_domain)
     @staticmethod
     def _normalize_proxy_url(proxy_value: str) -> str:
@@ -289,9 +289,8 @@ class VixSrcExtractor:
             raise ExtractorError("Invalid VixSrc URL")
         netloc = parsed.netloc
         if any(d in netloc.lower() for d in ("vixcloud.co", "vixsrc.to")):
-            if not _vixsrc_domain:
-                raise ExtractorError("VixSrc domain config unavailable")
-            netloc = _vixsrc_domain
+            if _vixsrc_domain:
+                netloc = _vixsrc_domain
         return f"{parsed.scheme}://{netloc}"
 
     def _get_random_proxy(self):
