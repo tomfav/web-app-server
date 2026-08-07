@@ -39,7 +39,7 @@ echo -e "${BLUE}  No WARP | proot-distro Ubuntu          ${NC}"
 echo -e "${BLUE}==========================================${NC}"
 echo ""
 
-info "Phase 1/5: Installing Termux packages..."
+info "Phase 1/6: Installing Termux packages..."
 termux-setup-storage 2>/dev/null || true
 # Termux is rolling-release and does not support partial upgrades.  Keep the
 # complete native environment aligned before installing individual packages;
@@ -49,9 +49,11 @@ DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
 pkg install -y proot-distro git curl pulseaudio wget screen
 log "Termux packages installed."
 
-info "Phase 2/5: Setting up Ubuntu environment..."
+info "Phase 2/6: Setting up Ubuntu environment..."
 PROOT_DISTRO_VERSION="$(proot-distro --version 2>/dev/null || true)"
 if [[ "$PROOT_DISTRO_VERSION" =~ ([0-9]+)(\.|$) ]] && (( BASH_REMATCH[1] >= 5 )); then
+    # proot-distro v5 installs OCI images instead of the legacy distribution
+    # aliases. Pin Ubuntu 24.04 instead of implicitly pulling "latest".
     DISTRO_IMAGE="ubuntu:24.04"
 fi
 
@@ -64,7 +66,7 @@ else
     log "Ubuntu installed."
 fi
 
-info "Phase 3/5: Configuring Ubuntu and installing EasyProxy..."
+info "Phase 3/6: Configuring Ubuntu and installing EasyProxy..."
 proot-distro login "$DISTRO_NAME" -- bash -s <<'UBUNTU_SETUP'
     set -Eeuo pipefail
     trap 'echo "[FATAL] Ubuntu setup failed at line $LINENO: $BASH_COMMAND" >&2' ERR
@@ -73,14 +75,7 @@ proot-distro login "$DISTRO_NAME" -- bash -s <<'UBUNTU_SETUP'
     echo "[INFO] Inside Ubuntu: Checking disk space..."
     df -h /
 
-    echo "[INFO] Inside Ubuntu: Switching to a more reliable mirror..."
-    sed -i "s|archive.ubuntu.com|mirrors.kernel.org|g" /etc/apt/sources.list || true
-    sed -i "s|security.ubuntu.com|mirrors.kernel.org|g" /etc/apt/sources.list || true
-
-    apt-get update -y
-    apt-get install -y software-properties-common
-
-    echo "[INFO] Inside Ubuntu: Updating packages..."
+    echo "[INFO] Inside Ubuntu: Refreshing apt metadata..."
     apt-get update -y
 
     ASOUND_PACKAGE="libasound2"
@@ -88,15 +83,35 @@ proot-distro login "$DISTRO_NAME" -- bash -s <<'UBUNTU_SETUP'
         ASOUND_PACKAGE="libasound2t64"
     fi
 
-    echo "[INFO] Inside Ubuntu: Installing Python, browser and runtime packages..."
+    echo "[INFO] Inside Ubuntu: Installing Python, Node.js and runtime packages..."
     apt-get install -y --fix-missing \
         python3 python3-venv python-is-python3 python3-pip git curl wget \
         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
         libxdamage1 libxfixes3 libxrandr2 libgbm1 "$ASOUND_PACKAGE" libpango-1.0-0 libcairo2 \
-        libatspi2.0-0 fonts-liberation ca-certificates nodejs procps \
+        libatspi2.0-0 fonts-liberation ca-certificates nodejs npm procps \
         libxshmfence1 libglu1-mesa libx11-xcb1 libxcb-dri3-0 libxss1 libxtst6 libxslt1.1
 
-    command -v node >/dev/null 2>&1
+    if ! command -v node >/dev/null 2>&1; then
+        if command -v nodejs >/dev/null 2>&1; then
+            NODEJS_BIN="$(command -v nodejs)"
+            NODE_LINK="/usr/local/bin/node"
+            if [ -e "$NODE_LINK" ] || [ -L "$NODE_LINK" ]; then
+                echo "[FATAL] $NODE_LINK exists but does not provide a working node command; refusing to overwrite it." >&2
+                exit 1
+            fi
+            echo "[INFO] Inside Ubuntu: Creating $NODE_LINK -> $NODEJS_BIN..."
+            install -d -m 0755 "$(dirname "$NODE_LINK")"
+            ln -s "$NODEJS_BIN" "$NODE_LINK"
+        else
+            echo "[FATAL] The nodejs package was installed, but neither node nor nodejs is available." >&2
+            exit 1
+        fi
+    fi
+
+    echo "[INFO] Inside Ubuntu: Verifying the Node.js toolchain..."
+    command -v node
+    node --version
+    npm --version
 
     EP_DIR="/root/EasyProxy"
     EP_REPO="https://github.com/realbestia1/EasyProxy.git"
@@ -136,7 +151,7 @@ proot-distro login "$DISTRO_NAME" -- bash -s <<'UBUNTU_SETUP'
 UBUNTU_SETUP
 log "Ubuntu environment and EasyProxy installation complete."
 
-info "Phase 4/5: Creating the Ubuntu launcher..."
+info "Phase 4/6: Creating the Ubuntu launcher..."
 proot-distro login "$DISTRO_NAME" -- bash -c '
     set -Eeuo pipefail
     target=/root/easyproxy_start.sh
@@ -232,7 +247,7 @@ wait "$APP_PID"
 LAUNCHER_EOF
 log "Ubuntu launcher created through proot-distro login."
 
-info "Phase 5/5: Creating Termux launcher scripts..."
+info "Phase 5/6: Creating Termux launcher scripts..."
 mkdir -p "$PREFIX/bin"
 cat > "$PREFIX/bin/easyproxy" << 'CMD_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -365,25 +380,103 @@ chmod +x "$PREFIX/bin/easyproxy-stop"
 
 cat > "$PREFIX/bin/easyproxy-logs" << 'LOGS_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-set -u
-LOG_DIR="$HOME/.easyproxy"
-echo "Opening logs... (Press Ctrl+A then D to exit logs without stopping)"
-if screen -list | grep -q "[.]easyproxy[[:space:]]"; then
-    screen -r easyproxy
-    exit 0
-fi
+set -Eeuo pipefail
 
-echo "No active screen session found. Showing saved logs instead."
-echo ""
-echo "--- Termux / screen log ---"
-tail -n 80 "$LOG_DIR/screen.log" 2>/dev/null || echo "No Termux log found."
-echo ""
-echo "--- Ubuntu bootstrap log ---"
-proot-distro login ubuntu -- bash -lc 'tail -n 120 /root/.easyproxy/easyproxy.log 2>/dev/null || echo "No Ubuntu log found."' 2>/dev/null || true
+LOG_DIR="$HOME/.easyproxy"
+TERMUX_LOG="$LOG_DIR/screen.log"
+
+show_help() {
+    cat <<'HELP'
+Usage:
+  easyproxy-logs             Follow the EasyProxy application log
+  easyproxy-logs --termux    Follow the Termux/screen log
+  easyproxy-logs --attach    Attach to the running screen session
+  easyproxy-logs --help      Show this help
+
+Press Ctrl+C to stop following a log. EasyProxy will keep running.
+When using --attach, detach with Ctrl+A, then D.
+HELP
+}
+
+case "${1:-}" in
+    ""|--app)
+        echo "Following EasyProxy application log. Press Ctrl+C to exit."
+        exec proot-distro login ubuntu -- bash -lc '
+            mkdir -p /root/.easyproxy
+            touch /root/.easyproxy/easyproxy.log
+            exec tail -n 150 -F /root/.easyproxy/easyproxy.log
+        '
+        ;;
+
+    --termux)
+        mkdir -p "$LOG_DIR"
+        touch "$TERMUX_LOG"
+        echo "Following Termux/screen log. Press Ctrl+C to exit."
+        exec tail -n 100 -F "$TERMUX_LOG"
+        ;;
+
+    --attach|-a)
+        if screen -list | grep -q "[.]easyproxy[[:space:]]"; then
+            echo "Attaching to EasyProxy screen."
+            echo "Detach with Ctrl+A, then D."
+            exec screen -r easyproxy
+        fi
+
+        echo "No active EasyProxy screen session found." >&2
+        exit 1
+        ;;
+
+    --help|-h)
+        show_help
+        ;;
+
+    *)
+        echo "Unknown option: $1" >&2
+        show_help >&2
+        exit 2
+        ;;
+esac
 LOGS_EOF
+
 chmod +x "$PREFIX/bin/easyproxy-logs"
 
 log "Launcher scripts created."
+
+info "Phase 6/6: Verifying the completed Ubuntu environment..."
+proot-distro login "$DISTRO_NAME" -- bash -s <<'FINAL_VERIFY'
+    set -uo pipefail
+
+    failures=0
+
+    verify_component() {
+        label="$1"
+        binary="$2"
+
+        if path="$(command -v "$binary" 2>/dev/null)" && \
+                version="$("$binary" --version 2>&1)" && [ -n "$version" ]; then
+            version="${version%%$'\n'*}"
+            printf '  %-10s %-7s %-28s %s\n' "$label" "OK" "$path" "$version"
+        else
+            printf '  %-10s %-7s %s\n' "$label" "MISSING" "command: $binary"
+            failures=$((failures + 1))
+        fi
+    }
+
+    echo ""
+    echo "EasyProxy component verification:"
+    printf '  %-10s %-7s %-28s %s\n' "Component" "Status" "Command" "Version"
+    verify_component "Python" "python3"
+    verify_component "Node" "node"
+    verify_component "npm" "npm"
+
+    if [ "$failures" -ne 0 ]; then
+        echo "[FATAL] Final verification failed: $failures required component(s) are unavailable." >&2
+        exit 1
+    fi
+
+    echo "[OK] All required Ubuntu components are available."
+FINAL_VERIFY
+log "Final component verification passed."
 
 echo ""
 echo -e "${GREEN}==========================================${NC}"

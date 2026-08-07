@@ -73,7 +73,10 @@ For Termux, full functionality requires a 64-bit Android device. On 32-bit devic
     - `easyproxy`: Start the full stack.
     - `easyproxy-update`: Update code and dependencies.
     - `easyproxy-stop`: Stop all services.
-    - `easyproxy-logs`: Attach to the running session or show the saved logs.
+    - `easyproxy-logs`: Follow the EasyProxy application log (`Ctrl+C` exits without stopping EasyProxy).
+    - `easyproxy-logs --termux`: Follow the Termux/screen log.
+    - `easyproxy-logs --attach`: Attach to the running screen session (`Ctrl+A`, then `D` to detach).
+    - `easyproxy-logs --help`: Show all logging options.
 
 If `easyproxy-update` reports `CANNOT LINK EXECUTABLE "curl"`, repair the
 partially upgraded Termux packages first, then retry the update:
