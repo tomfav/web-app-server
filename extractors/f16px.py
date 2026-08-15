@@ -130,6 +130,9 @@ def _solve_pow_parallel(nonce: str, difficulty: int, timeout: float = 60.0):
 
 class F16PxExtractor(BaseExtractor):
     F16PX_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0"
+    # Longer than the default 30s handler timeout: covers 6 sequential HTTP
+    # calls plus up to 60s for the PoW solve plus the final playback call.
+    REQUEST_TIMEOUT_TOTAL = 90
 
     def __init__(self, request_headers: dict, proxies: list = None):
         super().__init__(request_headers, proxies, extractor_name="f16px")
