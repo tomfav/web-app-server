@@ -19,7 +19,13 @@ from services.proxy_shared import (
 from extractors.registry import *
 import config_store
 import config as _config
-from config import reload_config, clear_proxy_affinity, get_system_stats
+from config import (
+    reload_config,
+    clear_proxy_affinity,
+    get_system_stats,
+    get_memory_profile,
+    reset_memory_profiler,
+)
 
 class HLSProxyPagesMixin:
 
@@ -277,8 +283,14 @@ class HLSProxyPagesMixin:
                     for s in getattr(self, '_proxy_sessions', {}).values()
                     if s and not s.closed and hasattr(s, '_connector') and hasattr(s._connector, '_conns')
                 ),
+                "parallel_fetch": dict(getattr(self, "_parallel_fetch_stats", {})),
             },
-            "memory": stats.get("proxy_ram", {}),
+            "memory": {
+                **stats.get("proxy_ram", {}),
+                "tracemalloc": stats.get("tracemalloc", {}),
+                "processes": stats.get("processes", {}),
+                "asyncio_tasks": stats.get("asyncio_tasks", {}),
+            },
             "modules": {
                 "playlist_builder": PlaylistBuilder is not None,
                 "vavoo_extractor": VavooExtractor is not None,
@@ -307,6 +319,8 @@ class HLSProxyPagesMixin:
                 "/license": "Proxy licenze DRM (ClearKey/Widevine) - ?url=<URL> o ?clearkey=<id:key>",
                 "/info": "Pagina HTML con informazioni sul server",
                 "/api/info": "Endpoint JSON con informazioni sul server",
+                "/api/memory/profile": "Profiler tracemalloc: allocazioni Python e crescita dal boot",
+                "/api/memory/profile/reset": "POST: resetta il baseline del profiler",
                 "/api/dual/memory": "RAM used by the integrated DUAL service",
                 "/dual/menifest.m3u8": "DUAL HLS master with synchronized video + audio - ?d=<Base64 JSON>",
                 "/dual/manifest.m3u8": "Correctly spelled alias for the DUAL HLS master - ?d=<Base64 JSON>",
@@ -326,6 +340,18 @@ class HLSProxyPagesMixin:
             },
         }
         return web.json_response(info)
+
+    async def handle_memory_profile(self, request):
+        """Return top Python allocations and growth since the profiler baseline."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+        return web.json_response(get_memory_profile(request.query.get("limit", 30)))
+
+    async def handle_memory_profile_reset(self, request):
+        """Reset the tracemalloc baseline used by the memory profiler."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+        return web.json_response(reset_memory_profiler())
 
     async def handle_openapi(self, request):
         """Espone una specifica OpenAPI minimale per Swagger/ReDoc."""
@@ -425,7 +451,7 @@ class HLSProxyPagesMixin:
                 "/dual/menifest.m3u8": {
                     "get": {
                         "summary": "DUAL HLS master",
-                        "description": "Builds one HLS master containing a selected video and an extracted, synchronized audio track. The d parameter is URL-safe Base64 JSON. The endpoint is intentionally named menifest for compatibility.",
+                        "description": "Builds one HLS master containing a selected video and an extracted, synchronized audio track. The video is always served through EasyProxy's HLS proxy. The d parameter is URL-safe Base64 JSON. The endpoint is intentionally named menifest for compatibility.",
                         "parameters": [
                             {"name": "d", "in": "query", "required": True, "schema": {"type": "string"}, "description": "URL-safe Base64 JSON DualSyncRequest payload."},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
