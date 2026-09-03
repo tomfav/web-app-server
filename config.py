@@ -36,7 +36,7 @@ ALL_PROXY_ERRORS = (
 )
 
 
-APP_VERSION = "2.11.8"
+APP_VERSION = "2.11.12"
 
 _MEMORY_PROFILE_FRAMES = 15
 _memory_profile_baseline = None
@@ -184,6 +184,9 @@ PROXY_TEST_TIMEOUT = 10
 cpu_cores = os.cpu_count() or 4
 PROXY_TEST_CONCURRENCY = 10 if cpu_cores == 1 else min(100, max(30, cpu_cores * 15))
 WARP_PROXY_URL = "socks5h://127.0.0.1:1080"
+# Monotonic timestamp of the last real WARP connector use. Health probes do
+# not update it; EasyProxy uses it to recycle WireProxy only after true idle.
+WARP_LAST_ACTIVITY = 0.0
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -780,6 +783,11 @@ def get_connector_for_proxy(proxy_url: str, **kwargs):
     if not proxy_url:
         return None
 
+    health_check = bool(kwargs.pop("health_check", False))
+    if proxy_url == WARP_PROXY_URL and not health_check:
+        global WARP_LAST_ACTIVITY
+        WARP_LAST_ACTIVITY = time.monotonic()
+
     connector_url = proxy_url
     rdns = kwargs.pop("rdns", False)
 
@@ -791,6 +799,13 @@ def get_connector_for_proxy(proxy_url: str, **kwargs):
         rdns = True
     elif connector_url.startswith("socks4://"):
         rdns = False
+
+    # WARP tunnel resta vivo; connessioni upstream no. Evita che ogni
+    # extractor mantenga socket CDN idle dentro WireProxy. force_close=True
+    # chiude il socket a fine response senza limitare concorrenza.
+    if proxy_url == WARP_PROXY_URL:
+        kwargs["force_close"] = True
+        kwargs.pop("keepalive_timeout", None)
 
     return ProxyConnector.from_url(connector_url, rdns=rdns, **kwargs)
 
@@ -1065,7 +1080,9 @@ def get_system_stats():
     main_process_rss = 0
     children_rss = 0
     ffmpeg_rss = 0
-    wireproxy_rss = 0
+    wireproxy_rss = 0  # Wireproxy child-process RSS
+    alighieri_rss = 0  # legacy API field; Alighieri is no longer shipped
+    wgx_rss = 0
     warp_rss = 0
     other_children_rss = 0
 
@@ -1075,6 +1092,10 @@ def get_system_stats():
             return "ffmpeg"
         if "wireproxy" in value:
             return "wireproxy"
+        if "alighieri" in value:
+            return "alighieri"
+        if "wgx" in value:
+            return "wgx"
         if "warp" in value or "wgcf" in value:
             return "warp"
         return "other"
@@ -1104,6 +1125,26 @@ def get_system_stats():
             "threads": threads,
         }
 
+    def _tracked_processes(proc):
+        """Return EasyProxy plus descendants and known proxy siblings."""
+        tracked = {proc.pid: proc}
+        try:
+            for child in proc.children(recursive=True):
+                tracked[child.pid] = child
+        except Exception:
+            pass
+        # entrypoint.sh starts wireproxy before Python, so wireproxy can be our sibling.
+        try:
+            parent = proc.parent()
+            for sibling in parent.children() if parent else []:
+                if sibling.pid == proc.pid:
+                    continue
+                if _process_role(sibling.name()) != "other":
+                    tracked[sibling.pid] = sibling
+        except Exception:
+            pass
+        return list(tracked.values())
+
     try:
         proc = psutil.Process(os.getpid())
         main_info = proc.memory_info()
@@ -1111,7 +1152,11 @@ def get_system_stats():
         proxy_ram_used = main_process_rss
         process_tree.append(_process_snapshot(proc, "easyproxy", main_info))
 
-        for child in proc.children(recursive=True):
+        tracked_processes = _tracked_processes(proc)
+        get_system_stats._tracked_processes = tracked_processes
+        for child in tracked_processes:
+            if child.pid == proc.pid:
+                continue
             try:
                 child_info = child.memory_info()
                 child_snapshot = _process_snapshot(child, _process_role(child.name()), child_info)
@@ -1123,6 +1168,10 @@ def get_system_stats():
                     ffmpeg_rss += child_rss
                 elif child_snapshot["role"] == "wireproxy":
                     wireproxy_rss += child_rss
+                elif child_snapshot["role"] == "alighieri":
+                    alighieri_rss += child_rss
+                elif child_snapshot["role"] == "wgx":
+                    wgx_rss += child_rss
                 elif child_snapshot["role"] == "warp":
                     warp_rss += child_rss
                 else:
@@ -1173,7 +1222,10 @@ def get_system_stats():
             _cpu_proc.cpu_percent(interval=None)  # establish baseline
 
         _cpu_children = getattr(get_system_stats, "_cpu_children", {})
-        current_children = {c.pid: c for c in _cpu_proc.children(recursive=True)}
+        current_children = {
+            c.pid: c for c in getattr(get_system_stats, "_tracked_processes", [])
+            if c.pid != _cpu_proc.pid
+        }
         # Drop dead children and baseline new ones
         for pid in list(_cpu_children.keys()):
             if pid not in current_children:
@@ -1231,6 +1283,10 @@ def get_system_stats():
             "ffmpeg_rss_mb": round(ffmpeg_rss / (1024 * 1024), 2),
             "wireproxy_rss": wireproxy_rss,
             "wireproxy_rss_mb": round(wireproxy_rss / (1024 * 1024), 2),
+            "alighieri_rss": alighieri_rss,
+            "alighieri_rss_mb": round(alighieri_rss / (1024 * 1024), 2),
+            "wgx_rss": wgx_rss,
+            "wgx_rss_mb": round(wgx_rss / (1024 * 1024), 2),
             "warp_rss": warp_rss,
             "warp_rss_mb": round(warp_rss / (1024 * 1024), 2),
             "other_children_rss": other_children_rss,
