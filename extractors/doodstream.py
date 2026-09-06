@@ -41,8 +41,9 @@ class DoodStreamExtractor:
 
     @staticmethod
     def _normalize_proxy_url(proxy_url: str) -> str:
+        # Keep local-DNS SOCKS5 for WARP; remote DNS via wireproxy can stall.
         if proxy_url.startswith("socks5://"):
-            return proxy_url.replace("socks5://", "socks5h://", 1)
+            return proxy_url
         if "://" not in proxy_url:
             return f"socks5h://{proxy_url}"
         return proxy_url
@@ -132,7 +133,9 @@ class DoodStreamExtractor:
         if normalized_proxy:
             request_kwargs["proxies"] = {"http": normalized_proxy, "https": normalized_proxy}
 
-        async with AsyncSession(impersonate="chrome124") as session:
+        async with AsyncSession(
+            impersonate="chrome124",
+        ) as session:
             response = await session.get(
                 embed_url,
                 headers={"User-Agent": _DOOD_UA},

@@ -55,9 +55,6 @@ class SyncEngine:
         self.offsets = offsets
         self.routing = RoutingOptions(forced_proxy=proxy.strip() or None)
         self.sample_seconds = 5
-        # Match Toast's conservative sample concurrency.  Some CDN edges
-        # throttle the burst created by parallel range downloads.
-        self._media_download_semaphore = asyncio.Semaphore(3)
         self._downloaded_bytes = 0
         self._download_cache: dict[tuple[str, tuple[tuple[str, str], ...]], Path] = {}
         self._download_locks: dict[tuple[str, tuple[tuple[str, str], ...]], asyncio.Lock] = {}
@@ -224,18 +221,17 @@ class SyncEngine:
             if self._download_cache_dir is not None:
                 digest = hashlib.sha256(repr(key).encode()).hexdigest()
                 target = self._download_cache_dir / f"{digest}.bin"
-            async with self._media_download_semaphore:
-                try:
-                    content = await self._download_ranged(url, headers)
-                except _RangeDownloadFallback:
-                    await self._get(
-                        url,
-                        headers,
-                        destination=target,
-                        max_bytes=self.MAX_MEDIA_BYTES,
-                    )
-                else:
-                    target.write_bytes(content)
+            try:
+                content = await self._download_ranged(url, headers)
+            except _RangeDownloadFallback:
+                await self._get(
+                    url,
+                    headers,
+                    destination=target,
+                    max_bytes=self.MAX_MEDIA_BYTES,
+                )
+            else:
+                target.write_bytes(content)
             if self._download_cache_dir is not None:
                 self._download_cache[key] = target
                 if target != path:
@@ -243,7 +239,7 @@ class SyncEngine:
 
     async def _download_ranged(self, url: str, headers: dict) -> bytes:
         """Fetch a media object in small ranges when the CDN throttles full GETs."""
-        chunk_size = 256 * 1024
+        chunk_size = 1024 * 1024
         base_headers = {
             key: value for key, value in (headers or {}).items()
             if str(key).lower() != "range"
@@ -692,7 +688,9 @@ class SyncEngine:
         audio_fp = str(payload.get("audio_fingerprint") or metadata.get("source_fingerprint") or "")
         cache_key = self.offsets.key(media_key, resolution, video_fp, audio_fp)
         payload["cache_key"] = cache_key
-        lookup = await self.offsets.lookup({"cache_key": cache_key, "media_key": media_key, "resolution": resolution, "video_fingerprint": video_fp, "audio_fingerprint": audio_fp, "vpsAccess": payload.get("vpsAccess", "")})
+        lookup = None
+        if not payload.get("_offset_cache_checked"):
+            lookup = await self.offsets.lookup({"cache_key": cache_key, "media_key": media_key, "resolution": resolution, "video_fingerprint": video_fp, "audio_fingerprint": audio_fp, "vpsAccess": payload.get("vpsAccess", "")})
         if lookup:
             cached_details = lookup.get("details") or lookup
             cached_status = str(cached_details.get("status") or lookup.get("status") or "")
@@ -999,8 +997,11 @@ class SyncEngine:
                 video_start_time,
             )
             if result["status"] != "ok":
+                # Linear anchor starts at 300s, not 60s: intros/logos often
+                # differ by <1s between editions, poisoning the edge sample
+                # while the rest of the film matches with a constant offset.
                 linear_positions = sorted(set(round(position, 3) for position in (
-                    min(60.0, common * .1),
+                    min(300.0, common * .1),
                     common * .5,
                     max(30.0, common - 90.0),
                 )))
@@ -1026,9 +1027,18 @@ class SyncEngine:
             else:
                 result["linear_measurements"] = linear_measurements
         if result["status"] != "ok":
+            def _summarize(items):
+                try:
+                    return ",".join(
+                        f"{float(item.get('position', 0.0)):.0f}:{float(item.get('correlation', 0.0)):.2f}@{float(item.get('offset', 0.0)):.2f}"
+                        for item in items or []
+                    ) or "-"
+                except (TypeError, ValueError):
+                    return "-"
             logger.warning(
                 "[DUAL] sync rejected video=%.3fs audio=%.3fs deviation=%.3fs "
-                "linear_samples=%d rate=%s linear_deviation=%s end_deviation=%s",
+                "linear_samples=%d rate=%s linear_deviation=%s end_deviation=%s "
+                "samples=%s linear=%s",
                 video_duration,
                 audio_duration,
                 float(result.get("deviation") or 0.0),
@@ -1036,6 +1046,8 @@ class SyncEngine:
                 result.get("candidate_rate", "-"),
                 result.get("linear_deviation", "-"),
                 result.get("end_deviation", "-"),
+                _summarize(measurements),
+                _summarize(linear_measurements),
             )
         if validate_muxed_reference:
             result["reference_matches_video"] = bool(reference_matches_video)

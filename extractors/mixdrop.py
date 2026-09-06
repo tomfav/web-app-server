@@ -116,7 +116,9 @@ class MixdropExtractor:
                     
                     async def fetch_page():
                         try:
-                            async with AsyncSession(impersonate="chrome120") as s:
+                            async with AsyncSession(
+                                impersonate="chrome120",
+                            ) as s:
                                 resp = await s.get(
                                     current_url,
                                     headers=m_headers,

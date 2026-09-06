@@ -316,6 +316,13 @@ class FlareSolverrManager:
                     payload["proxy"] = proxy_payload(proxy_url)
 
                 async with self._session.post(self.api_url, json=payload) as response:
+                    if response.status >= 400:
+                        try:
+                            error = await response.json(content_type=None)
+                            message = str(error.get("message") or "risposta senza dettagli")[:1500]
+                        except (ValueError, AttributeError):
+                            message = "risposta non JSON"
+                        raise FlareSolverrError(f"FlareSolverr HTTP {response.status}: {message}")
                     response.raise_for_status()
                     result = await response.json(content_type=None)
 

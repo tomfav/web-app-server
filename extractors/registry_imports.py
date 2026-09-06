@@ -49,6 +49,7 @@ MediasetExtractor = None
 WittyTVExtractor = None
 RaiPlayExtractor = None
 ADSExtractor = None
+CinejoyExtractor = None
 
 
 # Importazione condizionale degli estrattori
@@ -268,6 +269,13 @@ except Exception as e:
     logger.warning("⚠️ ADSExtractor failed to load: %s", e)
     ADSExtractor = None
 
+try:
+    from extractors.cinejoy import CinejoyExtractor
+    logger.info("✅ CinejoyExtractor module loaded.")
+except Exception as e:
+    logger.warning("⚠️ CinejoyExtractor failed to load: %s", e)
+    CinejoyExtractor = None
+
 
 __all__ = [
     "VavooExtractor",
@@ -305,4 +313,5 @@ __all__ = [
     "WittyTVExtractor",
     "RaiPlayExtractor",
     "ADSExtractor",
+    "CinejoyExtractor",
 ]

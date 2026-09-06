@@ -12,6 +12,8 @@ import hashlib
 import socket
 import config as _config
 import config_store
+from services.session_lifetime import retire_session
+from services.socks_bridge import close_socks_bridges
 
 import services.proxy_shared as _shared
 from services.proxy_shared import (
@@ -114,20 +116,39 @@ class HLSProxyCoreMixin:
                         p_sess = self._proxy_sessions.pop(p, None)
                         self._proxy_session_atimes.pop(p, None)
                         if p_sess and not p_sess.closed:
-                            await p_sess.close()
+                            retire_session(self, p_sess)
                             logger.info(f"[NET] Closed idle proxy session: {p}")
 
                 # 3. Close shared session if idle >30s
                 _session_atime = getattr(self, "_session_atime", 0)
                 if _session_atime and now - _session_atime > 30:
                     if self.session and not self.session.closed:
-                        await self.session.close()
+                        retire_session(self, self.session)
                         logger.info("[NET] Closed idle shared session (idle %.0fs)", now - _session_atime)
                     self.session = None
                     if self.flex_session and not self.flex_session.closed:
-                        await self.flex_session.close()
+                        retire_session(self, self.flex_session)
                         logger.info("[NET] Closed idle flex session (idle %.0fs)", now - _session_atime)
                     self.flex_session = None
+
+                # 3b. Close retired extractors older than 60s
+                if hasattr(self, "_retired_extractors") and self._retired_extractors:
+                    atimes = getattr(self, "_retired_extractor_atimes", None)
+                    if atimes is None:
+                        atimes = self._retired_extractor_atimes = {}
+                    still_retired = []
+                    for ext in self._retired_extractors:
+                        t = atimes.setdefault(id(ext), now)
+                        if now - t > 60:
+                            if hasattr(ext, "close"):
+                                try:
+                                    await ext.close()
+                                except Exception:
+                                    pass
+                            atimes.pop(id(ext), None)
+                        else:
+                            still_retired.append(ext)
+                    self._retired_extractors = still_retired
 
                 # 4. Compact Windows heap to release freed pages
                 await self._compact_heap()
@@ -232,80 +253,147 @@ class HLSProxyCoreMixin:
         return False
 
 
+    async def _wireproxy_process_state(self) -> tuple[str, str]:
+        """Return wireproxy process state without confusing it with tunnel state."""
+        control_script = "/app/scripts/warp_userspace_ctl.sh"
+        if not os.path.exists(control_script):
+            return "unknown", "control script unavailable"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                control_script,
+                "status",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3)
+            detail = (stdout or stderr).decode("utf-8", "replace").strip()
+            if proc.returncode == 0:
+                return "up", detail or "status=running"
+            return "down", detail or f"status exit={proc.returncode}"
+        except asyncio.TimeoutError:
+            return "unknown", "status check timeout"
+        except Exception as exc:
+            return "unknown", f"status check error={type(exc).__name__}"
+
+    async def _probe_warp(self, timeout_sec: float = 8.0) -> tuple[bool, str]:
+        """Check wireproxy process, SOCKS listener, and real WARP HTTP path."""
+        _ENABLE_WARP = _shared.ENABLE_WARP
+        _WARP_PROXY_URL = _shared.WARP_PROXY_URL
+        if not _ENABLE_WARP or not _WARP_PROXY_URL:
+            self._warp_ip = ""
+            return False, "WARP disabled or proxy URL missing"
+
+        self._warp_ip = ""
+
+        process_state, process_detail = await self._wireproxy_process_state()
+        socket_error = None
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", 1080),
+                timeout=min(3.0, timeout_sec),
+            )
+            writer.close()
+            await writer.wait_closed()
+        except Exception as exc:
+            socket_error = type(exc).__name__
+
+        if socket_error:
+            component = "wireproxy_process" if process_state == "down" else "wireproxy_socket"
+            return False, (
+                f"component={component} process={process_state}({process_detail}) "
+                f"socks=down error={socket_error}"
+            )
+
+        try:
+            connector = get_connector_for_proxy(
+                _WARP_PROXY_URL, limit=0, health_check=True
+            )
+            timeout = ClientTimeout(total=timeout_sec)
+            async with ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get("https://www.cloudflare.com/cdn-cgi/trace") as resp:
+                    body = await resp.text()
+
+            trace = {
+                line.split("=", 1)[0].strip(): line.split("=", 1)[1].strip()
+                for line in body.splitlines()
+                if "=" in line
+            }
+            warp_state = trace.get("warp", "").lower()
+            if resp.status != 200:
+                return False, (
+                    f"component=warp_tunnel process={process_state} socks=up "
+                    f"http_status={resp.status}"
+                )
+            if warp_state not in {"on", "plus"}:
+                return False, (
+                    f"component=warp_tunnel process={process_state} socks=up "
+                    f"warp={warp_state or 'unknown'}"
+                )
+
+            self._warp_ip = trace.get("ip", "")
+            return True, (
+                f"process={process_state} socks=up warp={warp_state} "
+                f"ip={self._warp_ip or 'unknown'}"
+            )
+        except Exception as exc:
+            detail = " ".join(str(exc).split())[:240]
+            suffix = f" detail={detail}" if detail else ""
+            return False, (
+                f"component=warp_tunnel process={process_state} socks=up "
+                f"error={type(exc).__name__}{suffix}"
+            )
+
     async def _warp_keepalive(self):
-        """Periodically test WARP tunnel without restarting it automatically."""
+        """Probe WARP periodically and reconnect after consecutive failures."""
+        consecutive_failures = 0
         while True:
             try:
                 await asyncio.sleep(30)
-                _ENABLE_WARP = _shared.ENABLE_WARP
-                _WARP_PROXY_URL = _shared.WARP_PROXY_URL
-                if not _ENABLE_WARP or not _WARP_PROXY_URL:
+                if not _shared.ENABLE_WARP or not _shared.WARP_PROXY_URL:
+                    consecutive_failures = 0
                     continue
-                try:
-                    connector = get_connector_for_proxy(
-                        _WARP_PROXY_URL, limit=0, family=socket.AF_INET, health_check=True
-                    )
-                    timeout = ClientTimeout(total=8)
-                    async with ClientSession(connector=connector, timeout=timeout) as session:
-                        async with session.get("https://api.ipify.org?format=json") as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                self._warp_ip = data.get("ip", "")
-                                continue
-                except Exception:
-                    pass
-                logger.warning("WARP health check failed; automatic reconnect is disabled")
+
+                healthy, reason = await self._probe_warp(timeout_sec=8)
+                if healthy:
+                    if consecutive_failures:
+                        logger.warning(
+                            "WARP health recovered after %s failed probe(s)",
+                            consecutive_failures,
+                        )
+                    consecutive_failures = 0
+                    continue
+
+                consecutive_failures += 1
+                logger.warning(
+                    "WARP health check failed (%s/2): %s",
+                    consecutive_failures,
+                    reason,
+                )
+                if consecutive_failures < 2:
+                    continue
+
+                result = await self.reconnect_warp()
+                message = result.get("message", "")
+                if result.get("status") == "ok" and message == "WARP userspace tunnel reconnected":
+                    logger.warning("WARP auto-reconnect succeeded")
+                    consecutive_failures = 0
+                else:
+                    logger.warning("WARP auto-reconnect skipped/failed: %s", message or result)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error("WARP keepalive error: %s", e)
                 await asyncio.sleep(10)
 
     async def is_warp_healthy(self, timeout_sec: float = 3.0) -> bool:
         """Fast check if WARP proxy socket and HTTP connectivity are working."""
-        _ENABLE_WARP = _shared.ENABLE_WARP
-        _WARP_PROXY_URL = _shared.WARP_PROXY_URL
-        if not _ENABLE_WARP or not _WARP_PROXY_URL:
-            return False
-        try:
-            connector = get_connector_for_proxy(
-                _WARP_PROXY_URL, limit=0, family=socket.AF_INET, health_check=True
-            )
-            timeout = ClientTimeout(total=timeout_sec)
-            async with ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get("https://api.ipify.org?format=json") as resp:
-                    if resp.status == 200:
-                        return True
-        except Exception:
-            pass
-        return False
+        healthy, _reason = await self._probe_warp(timeout_sec=timeout_sec)
+        return healthy
 
     async def get_warp_status(self) -> str:
         """Returns WARP status and fetches real external IP through WARP proxy."""
-        _ENABLE_WARP = _shared.ENABLE_WARP
-        _WARP_PROXY_URL = _shared.WARP_PROXY_URL
-        result = "Disconnected"
-        if _ENABLE_WARP and _WARP_PROXY_URL:
-            # Quick socket test to 127.0.0.1:1080 (no DNS, always fast)
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection("127.0.0.1", 1080), timeout=3
-                )
-                writer.close()
-                result = "Connected"
-                # Try to fetch the WARP IP via the proxy
-                try:
-                    connector = get_connector_for_proxy(
-                        _WARP_PROXY_URL, limit=0, family=socket.AF_INET, health_check=True
-                    )
-                    async with ClientSession(connector=connector, timeout=ClientTimeout(total=10)) as session:
-                        async with session.get("https://api.ipify.org?format=json") as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                self._warp_ip = data.get("ip", "")
-                except Exception:
-                    pass
-            except (OSError, asyncio.TimeoutError):
-                pass
-        return result
+        healthy, _reason = await self._probe_warp(timeout_sec=10)
+        return "Connected" if healthy else "Disconnected"
 
     async def _run_warp_control(self, action: str) -> int:
         """Run the explicit userspace WARP control action."""
@@ -318,7 +406,7 @@ class HLSProxyCoreMixin:
         return await asyncio.wait_for(proc.wait(), timeout=20)
 
     async def reconnect_warp(self) -> dict:
-        """Manually restart wireproxy; automatic reconnect remains disabled."""
+        """Restart wireproxy and verify the WARP path after reconnect."""
         if not hasattr(self, "_warp_reconnect_lock"):
             self._warp_reconnect_lock = asyncio.Lock()
 
@@ -335,9 +423,13 @@ class HLSProxyCoreMixin:
                 rc = await self._run_warp_control("restart")
                 if rc != 0:
                     return {"status": "error", "message": "wireproxy restart failed"}
-                if await self.is_warp_healthy(timeout_sec=8):
+                healthy, reason = await self._probe_warp(timeout_sec=8)
+                if healthy:
                     return {"status": "ok", "message": "WARP userspace tunnel reconnected"}
-                return {"status": "error", "message": "wireproxy is up but WARP health check failed"}
+                return {
+                    "status": "error",
+                    "message": f"wireproxy restart completed but WARP probe failed: {reason}",
+                }
             except (FileNotFoundError, asyncio.TimeoutError) as exc:
                 return {"status": "error", "message": f"WARP reconnect failed: {exc}"}
 
@@ -519,9 +611,6 @@ class HLSProxyCoreMixin:
                 "enable_cleanup_closed": True,
                 "use_dns_cache": True,
             }
-            if not prefer_default_family:
-                connector_kwargs["family"] = socket.AF_INET
-
             connector = TCPConnector(**connector_kwargs)
             session = aiohttp.ClientSession(
                 timeout=ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=30),
@@ -582,9 +671,22 @@ class HLSProxyCoreMixin:
         if _shared.BYPASS_PROXIES_CONTEXT.get():
             forced_proxy = None
 
-        # Stale proxy sessions cleanup (>60s idle, aligned with connector keepalive_timeout).
-        # WARP session stays pooled, but its connector never keeps upstream TCP
-        # connections alive; the WireProxy process/tunnel remains available.
+        # A generated manifest/segment URL can outlive an admin toggle and
+        # still carry the old WARP proxy in its query string. WARP=off or the
+        # admin WARP switch must invalidate that stale route before selecting
+        # a connector; otherwise direct mode still tries 127.0.0.1:1080.
+        if forced_proxy and _config.is_warp_proxy_url(forced_proxy) and (
+            bypass_warp or not _config._get_dynamic_warp_enabled()
+        ):
+            logger.debug(
+                "Ignoring stale WARP route %s (WARP bypassed/disabled)",
+                forced_proxy,
+            )
+            forced_proxy = None
+
+        # Stale proxy sessions cleanup (>60s idle, aligned with connector
+        # keepalive_timeout). The WARP session stays pooled; reusable upstream
+        # sockets avoid rebuilding SOCKS+TLS for every media request.
         if hasattr(self, "_proxy_session_atimes"):
             now = time.time()
             _warp_url = _shared.WARP_PROXY_URL
@@ -593,7 +695,7 @@ class HLSProxyCoreMixin:
                 p_sess = self._proxy_sessions.pop(p_url, None)
                 self._proxy_session_atimes.pop(p_url, None)
                 if p_sess and not p_sess.closed:
-                    await p_sess.close()
+                    retire_session(self, p_sess)
 
         proxy = forced_proxy or get_proxy_for_url(url, bypass_warp=bypass_warp)
         if not proxy and not _config.is_direct_connection_allowed(bypass_warp):
@@ -622,7 +724,7 @@ class HLSProxyCoreMixin:
                         oldest_sess = self._proxy_sessions.pop(oldest_proxy, None)
                         self._proxy_session_atimes.pop(oldest_proxy, None)
                         if oldest_sess and not oldest_sess.closed:
-                            await oldest_sess.close()
+                            retire_session(self, oldest_sess)
                             logger.info(f"[NET] Evicted oldest proxy session: {oldest_proxy}")
                 except Exception as e:
                     logger.warning(f"Failed to evict proxy session: {e}")
@@ -633,13 +735,13 @@ class HLSProxyCoreMixin:
                     connector_kwargs = {
                         "limit": 0,
                         "limit_per_host": 0,
-                        "family": socket.AF_INET,
                     }
                     if _shared.WARP_PROXY_URL and proxy == _shared.WARP_PROXY_URL:
-                        # Do not retain idle CDN sockets inside WireProxy after
-                        # a playlist/segment response completes. limit=0 stays:
-                        # this changes lifetime only, not concurrency.
-                        connector_kwargs["force_close"] = True
+                        # Reuse short-lived upstream connections during HLS
+                        # playback. Network failures invalidate this pooled
+                        # session and trigger a fresh WARP connection.
+                        connector_kwargs["keepalive_timeout"] = 15
+                        connector_kwargs["enable_cleanup_closed"] = True
                     else:
                         connector_kwargs["keepalive_timeout"] = 15
                     connector = get_connector_for_proxy(proxy, **connector_kwargs)
@@ -656,7 +758,7 @@ class HLSProxyCoreMixin:
             return SharedSessionWrapper(session), proxy
 
         session = await self._get_session(prefer_default_family=prefer_default_family)
-        return session, None
+        return SharedSessionWrapper(session), None
 
     async def _invalidate_proxy_session(self, proxy_url: str | None) -> bool:
         """Drop one pooled proxy session so the next request gets a new connector."""
@@ -668,7 +770,7 @@ class HLSProxyCoreMixin:
         if not session:
             return False
         if not session.closed:
-            await session.close()
+            retire_session(self, session)
         logger.warning("[NET] Invalidated pooled proxy session: %s", proxy_url)
         return True
 
@@ -696,7 +798,6 @@ class HLSProxyCoreMixin:
                 limit=0,
                 limit_per_host=0,
                 keepalive_timeout=15,
-                family=socket.AF_INET,
                 rdns=True,
             )
             timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
@@ -759,7 +860,25 @@ class HLSProxyCoreMixin:
         for key, cached_extractor in self.extractors.items():
             if cached_extractor is extractor:
                 return key
+        if extractor is not None:
+            name = getattr(extractor, "extractor_name", None)
+            if name:
+                return name
         return None
+
+    def _invalidate_extractors(self):
+        """Retire active extractors so in-flight requests can finish, while
+        new requests get fresh instances with updated routing/proxies."""
+        retired = getattr(self, "_retired_extractors", None)
+        if retired is None:
+            retired = self._retired_extractors = []
+        for extractor in list(self.extractors.values()):
+            retired.append(extractor)
+        self.extractors.clear()
+        if hasattr(self, "_extractor_atimes"):
+            self._extractor_atimes.clear()
+        if hasattr(self, "_extractor_stream_atimes"):
+            self._extractor_stream_atimes.clear()
 
     @staticmethod
     def _stream_key_for_url(url: str | None) -> str | None:
@@ -769,11 +888,17 @@ class HLSProxyCoreMixin:
 
     def _touch_extractor_activity(self, extractor_key: str | None = None, stream_key: str | None = None):
         now = time.time()
-        if extractor_key and extractor_key in self.extractors:
-            self._extractor_atimes[extractor_key] = now
-            if stream_key:
-                self._extractor_stream_atimes[(extractor_key, stream_key)] = now
-            return
+        if extractor_key:
+            normalized = extractor_key.replace("_direct", "").replace("_noproxy", "")
+            matched = False
+            for k in list(self.extractors.keys()):
+                if k == extractor_key or k.startswith(normalized):
+                    self._extractor_atimes[k] = now
+                    if stream_key:
+                        self._extractor_stream_atimes[(k, stream_key)] = now
+                    matched = True
+            if matched:
+                return
         for key in self.extractors:
             self._extractor_atimes[key] = now
             if stream_key:
@@ -811,12 +936,31 @@ class HLSProxyCoreMixin:
 
     async def cleanup(self):
         """Pulizia delle risorse"""
+        prefetch_tasks = list(getattr(self, "prefetch_tasks", set()))
+        for task in prefetch_tasks:
+            task.cancel()
+        if prefetch_tasks:
+            await asyncio.gather(*prefetch_tasks, return_exceptions=True)
+        self.prefetch_tasks.clear()
+        for entry in getattr(self, "_segment_prefetch_cache", {}).values():
+            timer = entry.get("timer")
+            if timer:
+                timer.cancel()
+        getattr(self, "_segment_prefetch_cache", {}).clear()
+        getattr(self, "_segment_next_urls", {}).clear()
+        getattr(self, "_hls_playlist_cache", {}).clear()
+
         tasks = list(self._background_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+        retired = list(getattr(self, "_retired_session_tasks", ()))
+        for task in retired:
+            task.cancel()
+        if retired:
+            await asyncio.gather(*retired, return_exceptions=True)
 
         try:
             if self.session and not self.session.closed:
@@ -832,11 +976,24 @@ class HLSProxyCoreMixin:
                 if hasattr(self, "_proxy_session_atimes"):
                     self._proxy_session_atimes.clear()
 
-            for extractor in self.extractors.values():
+            for extractor in list(self.extractors.values()):
                 if hasattr(extractor, "close"):
                     await extractor.close()
             self.extractors.clear()
-            self._extractor_atimes.clear()
-            self._extractor_stream_atimes.clear()
+            if hasattr(self, "_extractor_atimes"):
+                self._extractor_atimes.clear()
+            if hasattr(self, "_extractor_stream_atimes"):
+                self._extractor_stream_atimes.clear()
+
+            retired = list(getattr(self, "_retired_extractors", ()))
+            for extractor in retired:
+                if hasattr(extractor, "close"):
+                    await extractor.close()
+            if hasattr(self, "_retired_extractors"):
+                self._retired_extractors.clear()
+            if hasattr(self, "_retired_extractor_atimes"):
+                self._retired_extractor_atimes.clear()
+
+            await close_socks_bridges()
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")

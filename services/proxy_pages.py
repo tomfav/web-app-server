@@ -1249,7 +1249,7 @@ class HLSProxyPagesMixin:
             clear_proxy_affinity()
             # Invalidate extractor cache if proxy/routing/WARP settings changed
             if any(k in updates for k in ("global_proxies", "extractor_proxies", "transport_routes", "warp_off_extractors", "proxy_off_extractors", "warp_exclude_domains_custom", "proxy_exclude_domains", "enable_warp")):
-                self.extractors.clear()
+                self._invalidate_extractors()
                 logger.info("Extractor cache cleared due to config change")
 
         return web.json_response({"status": "ok", "updated": list(updates.keys())})
@@ -1266,7 +1266,7 @@ class HLSProxyPagesMixin:
         config_store.set("enable_warp", bool(enable))
         reload_config()
         clear_proxy_affinity()
-        self.extractors.clear()
+        self._invalidate_extractors()
 
         if enable:
             logger.info("WARP enabled via admin panel")
@@ -1314,7 +1314,7 @@ class HLSProxyPagesMixin:
         config_store.set("extractor_proxies", extractor_proxies)
         reload_config()
         clear_proxy_affinity()
-        self.extractors.clear()
+        self._invalidate_extractors()
 
         return web.json_response({"status": "ok", "extractor": extractor, "proxy": proxy or None})
 
@@ -1346,7 +1346,7 @@ class HLSProxyPagesMixin:
             config_store.replace_all(data)
             reload_config()
             clear_proxy_affinity()
-            self.extractors.clear()
+            self._invalidate_extractors()
             return web.json_response({"status": "ok", "message": "Config imported successfully"})
         except json.JSONDecodeError:
             return web.Response(status=400, text="Invalid JSON file")

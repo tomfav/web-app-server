@@ -7,6 +7,7 @@ WIREPROXY_CONFIG="/tmp/easyproxy-warp/wireproxy.conf"
 LOG_FILE="/var/log/wireproxy.log"
 WIREPROXY_BIN="/usr/local/bin/wireproxy"
 SOCKS_ADDR="127.0.0.1:1080"
+TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
 
 pid_is_wireproxy() {
     pid="$1"
@@ -75,6 +76,30 @@ stop_wireproxy() {
     rm -f "$WIREPROXY_CONFIG"
 }
 
+probe_warp() {
+    pid=$(read_pid 2>/dev/null || true)
+    if [ -z "$pid" ] || ! pid_is_wireproxy "$pid"; then
+        echo "WARP probe: wireproxy process is down." >&2
+        return 1
+    fi
+
+    trace=$(curl --socks5 "$SOCKS_ADDR" -fsS \
+        --connect-timeout 3 --max-time 8 "$TRACE_URL" 2>&1) || {
+        echo "WARP probe: SOCKS traffic failed: $trace" >&2
+        return 1
+    }
+
+    printf '%s\n' "$trace"
+    printf '%s\n' "$trace" | grep -Eq '^warp=(on|plus)$' || {
+        echo "WARP probe: Cloudflare did not report warp=on/plus." >&2
+        return 1
+    }
+    printf '%s\n' "$trace" | grep -Eq '^ip=[^[:space:]]+$' || {
+        echo "WARP probe: Cloudflare did not return an egress IP." >&2
+        return 1
+    }
+}
+
 case "${1:-status}" in
     start)
         start_wireproxy
@@ -85,6 +110,9 @@ case "${1:-status}" in
     restart)
         stop_wireproxy
         start_wireproxy
+        ;;
+    probe)
+        probe_warp
         ;;
     status)
         pid=$(read_pid 2>/dev/null || true)

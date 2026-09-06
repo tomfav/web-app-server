@@ -7,6 +7,7 @@ import asyncio
 import contextvars
 import tracemalloc
 import urllib.request
+import ipaddress
 from dotenv import load_dotenv
 from config_store import (
     DEFAULT_RECORDINGS_DIR,
@@ -15,6 +16,7 @@ from config_store import (
     get_all as _cfg_get_all,
 )
 from aiohttp_socks import (
+    ProxyConnector,
     ProxyError as AioProxyError,
     ProxyConnectionError as AioProxyConnectionError,
     ProxyTimeoutError as AioProxyTimeoutError,
@@ -24,7 +26,6 @@ from python_socks import (
     ProxyConnectionError as PyProxyConnectionError,
     ProxyTimeoutError as PyProxyTimeoutError,
 )
-
 ALL_PROXY_ERRORS = (
     AioProxyError,
     AioProxyConnectionError,
@@ -35,7 +36,7 @@ ALL_PROXY_ERRORS = (
 )
 
 
-APP_VERSION = "2.11.17"
+APP_VERSION = "2.11.29"
 
 _MEMORY_PROFILE_FRAMES = 15
 _memory_profile_baseline = None
@@ -182,7 +183,9 @@ LOG_LEVEL = LOG_LEVEL_MAP.get(LOG_LEVEL_STR, logging.WARNING)
 PROXY_TEST_TIMEOUT = 10
 cpu_cores = os.cpu_count() or 4
 PROXY_TEST_CONCURRENCY = 10 if cpu_cores == 1 else min(100, max(30, cpu_cores * 15))
-WARP_PROXY_URL = "socks5h://127.0.0.1:1080"
+# Keep WARP as a normal dual-stack SOCKS route. The generated wgcf profile and
+# wireproxy decide which address family is usable for each destination.
+WARP_PROXY_URL = "socks5://127.0.0.1:1080"
 # Monotonic timestamp of the last real WARP connector use. Health probes do
 # not update it; EasyProxy uses it to recycle WireProxy only after true idle.
 WARP_LAST_ACTIVITY = 0.0
@@ -361,10 +364,13 @@ def _get_dynamic_warp_exclude_domains() -> list:
     return merged
 
 def _is_warp_excluded(url: str) -> bool:
-    normalized = url.lower()
-    for domain in WARP_EXCLUDE_DOMAINS:
-        stripped = domain.lstrip("*.")
-        if stripped in normalized:
+    return _matches_excluded_host(url, WARP_EXCLUDE_DOMAINS)
+
+def _matches_excluded_host(url: str, domains: list) -> bool:
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower().rstrip(".")
+    for domain in domains:
+        domain = domain.lower().strip().lstrip("*.").rstrip(".")
+        if domain and (host == domain or host.endswith("." + domain)):
             return True
     return False
 
@@ -372,14 +378,7 @@ def _get_dynamic_proxy_exclude_domains() -> list:
     return _cfg_get("proxy_exclude_domains", [])
 
 def _is_proxy_excluded(url: str) -> bool:
-    if not url:
-        return False
-    normalized = url.lower()
-    for domain in PROXY_EXCLUDE_DOMAINS:
-        stripped = domain.lstrip("*.")
-        if stripped in normalized:
-            return True
-    return False
+    return _matches_excluded_host(url, PROXY_EXCLUDE_DOMAINS)
 
 def _get_dynamic_global_proxies() -> list:
     return _cfg_get("global_proxies", [])
@@ -414,11 +413,11 @@ def get_ordered_proxies_for_url(
 
     _ENABLE_WARP = _get_dynamic_warp_enabled()
     _WARP_PROXY_URL = WARP_PROXY_URL
+    if bypass_warp is None:
+        bypass_warp = BYPASS_WARP_CONTEXT.get()
     
     if bypass_proxies:
         ordered = []
-        if bypass_warp is None:
-            bypass_warp = BYPASS_WARP_CONTEXT.get()
         is_excluded = _is_warp_excluded(url or "")
         if _ENABLE_WARP and not bypass_warp and not is_excluded:
             ordered.append(_WARP_PROXY_URL)
@@ -445,7 +444,10 @@ def get_ordered_proxies_for_url(
     if (
         selected_proxy
         and selected_proxy_is_strict
-        and not (bypass_warp and selected_proxy == _WARP_PROXY_URL)
+        and not (
+            is_warp_proxy_url(selected_proxy)
+            and (bypass_warp or not _ENABLE_WARP)
+        )
     ):
         return build([selected_proxy], strict=True)
 
@@ -454,29 +456,37 @@ def get_ordered_proxies_for_url(
         for route in _TRANSPORT_ROUTES:
             url_pattern = route["url"].lower()
             if url_pattern in normalized_url:
-                add(route.get("proxy"))
+                route_proxy = route.get("proxy")
+                if not (
+                    is_warp_proxy_url(route_proxy)
+                    and (bypass_warp or not _ENABLE_WARP)
+                ):
+                    add(route_proxy)
                 break
 
     extractor_proxies = get_extractor_proxies(extractor_name or "")
     for proxy in extractor_proxies:
-        if proxy != _WARP_PROXY_URL:
+        if not is_warp_proxy_url(proxy):
             add(proxy)
 
-    if selected_proxy and selected_proxy != _WARP_PROXY_URL:
+    if selected_proxy and not is_warp_proxy_url(selected_proxy):
         add(selected_proxy)
 
     for proxy in fallback_proxies or []:
-        if proxy != _WARP_PROXY_URL:
+        if not is_warp_proxy_url(proxy):
             add(proxy)
 
     for proxy in _GLOBAL_PROXIES:
-        if proxy != _WARP_PROXY_URL:
+        if not is_warp_proxy_url(proxy):
             add(proxy)
 
-    if bypass_warp is None:
-        bypass_warp = BYPASS_WARP_CONTEXT.get()
     is_excluded = _is_warp_excluded(url or "")
-    if _ENABLE_WARP and not bypass_warp and not is_excluded:
+    if (
+        _ENABLE_WARP
+        and not bypass_warp
+        and not is_excluded
+        and not any(is_warp_proxy_url(proxy) for proxy in ordered)
+    ):
         add(_WARP_PROXY_URL)
 
     return ProxyList(ordered, strict=False)
@@ -633,7 +643,7 @@ def mark_proxy_dead(proxy_url: str, dead_duration: int = 300):
         return
 
     _WARP_PROXY_URL = WARP_PROXY_URL
-    if _WARP_PROXY_URL and proxy_url == _WARP_PROXY_URL:
+    if _WARP_PROXY_URL and is_warp_proxy_url(proxy_url):
         logging.warning("WARP proxy %s failure observed; keeping it managed by socket health checks.", proxy_url)
         return
 
@@ -750,8 +760,10 @@ def get_connector_for_proxy(proxy_url: str, **kwargs):
     if not proxy_url:
         return None
 
+    force_ipv4 = bool(kwargs.pop("force_ipv4", False))
     health_check = bool(kwargs.pop("health_check", False))
-    if proxy_url == WARP_PROXY_URL and not health_check:
+    is_warp = is_warp_proxy_url(proxy_url)
+    if is_warp and not health_check:
         global WARP_LAST_ACTIVITY
         WARP_LAST_ACTIVITY = time.monotonic()
 
@@ -767,18 +779,61 @@ def get_connector_for_proxy(proxy_url: str, **kwargs):
     elif connector_url.startswith("socks4://"):
         rdns = False
 
-    # WARP tunnel resta vivo; connessioni upstream no. Evita che ogni
-    # extractor mantenga socket CDN idle dentro WireProxy. force_close=True
-    # chiude il socket a fine response senza limitare concorrenza.
-    if proxy_url == WARP_PROXY_URL:
-        kwargs["force_close"] = True
-        kwargs.pop("keepalive_timeout", None)
+    # Keep upstream connections reusable. Reopening a SOCKS+TLS connection
+    # for every playlist/segment overloads userspace WireProxy and causes
+    # avoidable timeouts/buffering. The caller still controls pool limits and
+    # idle cleanup.
+    if is_warp:
+        kwargs.setdefault("keepalive_timeout", 15)
+        kwargs.setdefault("force_close", False)
 
-    return ProxyConnector.from_url(connector_url, rdns=rdns, **kwargs)
+    connector_cls = ProxyConnector
+    if force_ipv4:
+        connector_cls = _IPv4ProxyConnector
+        kwargs.setdefault("family", socket.AF_INET)
+
+    return connector_cls.from_url(connector_url, rdns=rdns, **kwargs)
+
+
+class _IPv4ProxyConnector(ProxyConnector):
+    """Proxy connector that resolves upstream hostnames only to IPv4."""
+
+    async def _connect_via_proxy(self, host, port, ssl=None, timeout=None):
+        try:
+            target = ipaddress.ip_address(host)
+            if target.version != 4:
+                raise OSError(f"IPv4-only route cannot use IPv{target.version} target")
+            ipv4_host = host
+        except ValueError:
+            infos = await self._loop.getaddrinfo(
+                host,
+                port,
+                family=socket.AF_INET,
+                type=socket.SOCK_STREAM,
+            )
+            if not infos:
+                raise OSError(f"No IPv4 address found for {host}")
+            ipv4_host = infos[0][4][0]
+
+        return await super()._connect_via_proxy(ipv4_host, port, ssl, timeout)
+
+
+def is_warp_proxy_url(proxy_url: str | None) -> bool:
+    """Return True for the configured WARP SOCKS endpoint (socks5h/socks5)."""
+    if not proxy_url or not WARP_PROXY_URL:
+        return False
+
+    def canonical(value: str) -> str:
+        value = str(value).strip().rstrip("/")
+        if value.startswith("socks5h://"):
+            value = "socks5://" + value[len("socks5h://") :]
+        return value
+
+    return canonical(proxy_url) == canonical(WARP_PROXY_URL)
 
 
 def get_solver_proxy_url(proxy_url: str | None) -> str | None:
-    """Normalizza il proxy per solver/browser che non supportano socks5h/socks4a."""
+    """Return a browser-safe proxy while preserving the selected route."""
     if not proxy_url:
         return None
 

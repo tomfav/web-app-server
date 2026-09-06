@@ -40,7 +40,8 @@ start_userspace_warp() {
             echo "wireproxy exited during startup."
             return 1
         fi
-        if nc -z "$WARP_PROXY_HOST" "$WARP_PROXY_PORT"; then
+        if nc -z "$WARP_PROXY_HOST" "$WARP_PROXY_PORT" && \
+           "$WARPCTL" probe >/dev/null 2>&1; then
             echo "WARP userspace WireGuard + wireproxy SOCKS5 ready on ${WARP_PROXY_HOST}:${WARP_PROXY_PORT}."
             return 0
         fi
@@ -51,8 +52,7 @@ start_userspace_warp() {
     return 1
 }
 
-# No supervisor/restart loop: wireproxy starts once. Health checks report failure;
-# reconnect is explicit/manual only.
+# EasyProxy watchdog checks wireproxy/WARP and reconnects after consecutive failures.
 cleanup() {
     "$WARPCTL" stop >/dev/null 2>&1 || true
 }
