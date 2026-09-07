@@ -1,9 +1,9 @@
 import asyncio
-import hashlib
 import os
 import re
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import config_store
 import config as _config
@@ -45,12 +45,19 @@ from services.proxy_shared import (
 class _ParallelFallback(Exception):
     """Raised when parallel range fetch is not applicable; falls back to single connection."""
 
+
+# Do not share asyncio's default executor with WARP/proxy socket health checks.
+# Those checks can block for seconds and otherwise delay ClearKey decryption,
+# even though the actual AES/MP4 operation is fast.
+_CLEARKEY_EXECUTOR = ThreadPoolExecutor(
+    thread_name_prefix="clearkey",
+)
+
 # Parallel range fetch thresholds: beat per-connection CDN throttling (e.g. vidsonic
 # ~1.7 Mbps/conn vs 2.4 Mbps video) by downloading one segment over K parallel
 # range requests. Only triggers for large segments on range-enabled CDNs.
 _PARALLEL_MIN_SIZE = 1_500_000  # 1.5 MB
 _PARALLEL_PARTS = 3
-_PREFETCH_TTL = 6.0
 
 
 class HLSProxyStreamingMixin:
@@ -90,174 +97,6 @@ class HLSProxyStreamingMixin:
             return
         for key in sorted(cache.keys(), key=lambda k: cache[k][1] if isinstance(cache[k], tuple) else 0)[:trim_count]:
             cache.pop(key, None)
-
-    @staticmethod
-    def _segment_request_key(value):
-        """Build a stable, secret-free key for a generated segment URL."""
-        parsed = urllib.parse.urlsplit(str(value))
-        query = urllib.parse.urlencode(
-            sorted(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-        )
-        canonical = parsed.path + (f"?{query}" if query else "")
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-    def _register_segment_prefetch_chain(self, playlist: str):
-        """Remember the next generated decrypt URL for each playlist segment."""
-        segment_urls = [
-            line.strip()
-            for line in playlist.splitlines()
-            if line.strip().startswith(("http://", "https://"))
-            and "/decrypt/segment." in line
-        ]
-        if len(segment_urls) < 2:
-            return
-
-        next_urls = getattr(self, "_segment_next_urls", None)
-        if next_urls is None:
-            next_urls = {}
-            self._segment_next_urls = next_urls
-        now = time.monotonic()
-        for current_url, next_url in zip(segment_urls, segment_urls[1:]):
-            next_urls[self._segment_request_key(current_url)] = (now + 30.0, next_url)
-
-        for key, entry in list(next_urls.items()):
-            if entry[0] <= now:
-                next_urls.pop(key, None)
-        while len(next_urls) > 256:
-            next_urls.pop(next(iter(next_urls)), None)
-
-    def _expire_prefetched_segment(self, cache_key, entry):
-        cache = getattr(self, "_segment_prefetch_cache", None)
-        if not cache or cache.get(cache_key) is not entry:
-            return
-        cache.pop(cache_key, None)
-        timer = entry.get("timer")
-        if timer:
-            timer.cancel()
-        task = entry.get("task")
-        if task and not task.done():
-            task.cancel()
-        logger.debug("[Prefetch] expired and removed: key=%s", cache_key[:12])
-
-    async def _serve_prefetched_segment(self, request):
-        cache = getattr(self, "_segment_prefetch_cache", None)
-        if not cache:
-            return None
-
-        cache_key = self._segment_request_key(request.path_qs)
-        entry = cache.get(cache_key)
-        if not entry:
-            return None
-        if entry["expires"] <= time.monotonic():
-            self._expire_prefetched_segment(cache_key, entry)
-            return None
-
-        try:
-            result = await asyncio.shield(entry["task"])
-        except asyncio.CancelledError:
-            self._expire_prefetched_segment(cache_key, entry)
-            return None
-        except Exception as error:
-            logger.debug("[Prefetch] failed before player request: %r", error)
-            self._expire_prefetched_segment(cache_key, entry)
-            return None
-
-        if cache.get(cache_key) is entry:
-            cache.pop(cache_key, None)
-            timer = entry.get("timer")
-            if timer:
-                timer.cancel()
-
-        if not result:
-            return None
-        body, content_type = result
-        logger.info(
-            "⚡ [Prefetch] served: track=%s bytes=%d",
-            request.query.get("media_type", "unknown"),
-            len(body),
-        )
-        return web.Response(
-            body=body,
-            status=200,
-            headers={
-                "Content-Type": content_type,
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
-
-    async def _run_segment_prefetch(self, proxy_url):
-        """Run normal decrypt handler for a prefetched generated URL."""
-        from aiohttp.test_utils import make_mocked_request
-
-        parsed = urllib.parse.urlsplit(proxy_url)
-        path_qs = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-        path_qs += "&prefetch=1" if "?" in path_qs else "?prefetch=1"
-
-        try:
-            mocked_request = make_mocked_request("GET", path_qs)
-            response = await self.handle_decrypt_segment(mocked_request)
-            if not isinstance(response, web.Response) or response.status != 200:
-                return None
-            if response.body is None:
-                return None
-            return bytes(response.body), response.headers.get("Content-Type", "video/mp4")
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.debug("[Prefetch] request failed: %r", error)
-            return None
-
-    def _schedule_next_segment_prefetch(self, request):
-        if request.query.get("prefetch") == "1":
-            return
-        next_urls = getattr(self, "_segment_next_urls", None)
-        if not next_urls:
-            return
-
-        current_key = self._segment_request_key(request.path_qs)
-        next_entry = next_urls.get(current_key)
-        if not next_entry or next_entry[0] <= time.monotonic():
-            next_urls.pop(current_key, None)
-            return
-
-        next_url = next_entry[1]
-        cache = getattr(self, "_segment_prefetch_cache", None)
-        if cache is None:
-            cache = {}
-            self._segment_prefetch_cache = cache
-        next_key = self._segment_request_key(next_url)
-        existing = cache.get(next_key)
-        if existing and existing["expires"] > time.monotonic():
-            return
-        if existing:
-            self._expire_prefetched_segment(next_key, existing)
-
-        now = time.monotonic()
-        task = asyncio.create_task(self._run_segment_prefetch(next_url))
-        entry = {
-            "created": now,
-            "expires": now + _PREFETCH_TTL,
-            "task": task,
-            "timer": None,
-        }
-        entry["timer"] = asyncio.get_running_loop().call_later(
-            _PREFETCH_TTL,
-            self._expire_prefetched_segment,
-            next_key,
-            entry,
-        )
-        cache[next_key] = entry
-        self.prefetch_tasks.add(task)
-        task.add_done_callback(self.prefetch_tasks.discard)
-
-        logger.debug(
-            "[Prefetch] scheduled: track=%s ttl=%.1fs pending=%d",
-            request.query.get("media_type", "unknown"),
-            _PREFETCH_TTL,
-            len(cache),
-        )
 
     async def handle_ts_segment(self, request):
         """Gestisce richieste per segmenti .ts"""
@@ -308,7 +147,10 @@ class HLSProxyStreamingMixin:
             )
             return web.Response(text=f"Segment error: {str(e)}", status=500)
 
-    async def _proxy_segment_parallel(self, request, segment_url, headers, segment_name, bypass_warp, forced_proxy):
+    async def _proxy_segment_parallel(
+        self, request, segment_url, headers, segment_name, bypass_warp, forced_proxy,
+        session_key=None,
+    ):
         stats = getattr(self, "_parallel_fetch_stats", None)
         if stats is None:
             stats = {
@@ -328,7 +170,8 @@ class HLSProxyStreamingMixin:
         stats["last_segment"] = str(segment_name or "")[:160]
         try:
             result = await self._proxy_segment_parallel_impl(
-                request, segment_url, headers, segment_name, bypass_warp, forced_proxy
+                request, segment_url, headers, segment_name, bypass_warp, forced_proxy,
+                session_key=session_key,
             )
             stats["successes"] += 1
             stats["last_status"] = "success"
@@ -348,7 +191,10 @@ class HLSProxyStreamingMixin:
             stats["active"] = max(0, stats["active"] - 1)
             stats["last_duration_ms"] = round((time.monotonic() - started) * 1000, 1)
 
-    async def _proxy_segment_parallel_impl(self, request, segment_url, headers, segment_name, bypass_warp, forced_proxy):
+    async def _proxy_segment_parallel_impl(
+        self, request, segment_url, headers, segment_name, bypass_warp, forced_proxy,
+        session_key=None,
+    ):
         """Download one segment via K parallel range requests to beat per-connection
         CDN throttling (e.g. vidsonic limits each TCP connection to ~1.7 Mbps while
         the video is 2.4 Mbps; 3 parallel ranges -> ~5 Mbps aggregate).
@@ -369,7 +215,10 @@ class HLSProxyStreamingMixin:
         # 1) Probe size + Accept-Ranges with a 1-byte range request.
         probe_headers = {**base_headers, "Range": "bytes=0-0"}
         session, session_proxy = await self._get_proxy_session(
-            segment_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
+            segment_url,
+            bypass_warp=bypass_warp,
+            forced_proxy=forced_proxy,
+            session_key=session_key,
         )
         total = None
         try:
@@ -428,7 +277,10 @@ class HLSProxyStreamingMixin:
         async def _fetch_part_into(start, end):
             h = {**base_headers, "Range": f"bytes={start}-{end}"}
             s, s_proxy = await self._get_proxy_session(
-                segment_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
+                segment_url,
+                bypass_warp=bypass_warp,
+                forced_proxy=forced_proxy,
+                session_key=session_key,
             )
             try:
                 async with s.get(
@@ -521,6 +373,12 @@ class HLSProxyStreamingMixin:
                 if header in request.headers:
                     headers[header] = request.headers[header]
 
+            # DASH SegmentList relays carry the source byte-range in the
+            # generated URL. Forward it when the player sends no Range header.
+            source_range = request.query.get("range")
+            if source_range and re.fullmatch(r"\d+-\d+", source_range):
+                headers["Range"] = f"bytes={source_range}"
+
             # Media segments must not be content-encoded in transit.  aiohttp
             # transparently decodes gzip/br, while forwarding the upstream
             # Content-Length would make Safari wait for bytes that no longer
@@ -543,6 +401,10 @@ class HLSProxyStreamingMixin:
                 forced_proxy, bypass_warp
             )
 
+            stream_session_key = request.query.get("stream_key") or self._stream_key_for_url(
+                request.query.get("orig_url") or segment_url
+            )
+
             current_proxy = forced_proxy
             attempts = 2 if forced_proxy else 1
             session = None
@@ -553,7 +415,10 @@ class HLSProxyStreamingMixin:
             for attempt in range(attempts):
                 try:
                     session, session_proxy = await self._get_proxy_session(
-                        segment_url, bypass_warp=bypass_warp, forced_proxy=current_proxy
+                        segment_url,
+                        bypass_warp=bypass_warp,
+                        forced_proxy=current_proxy,
+                        session_key=stream_session_key,
                     )
                     disable_ssl = get_ssl_setting_for_url(segment_url) or check_vavoo_request(headers, request, segment_url)
                     # ✅ Use yarl.URL with encoded=True to prevent double-encoding of commas
@@ -739,7 +604,7 @@ class HLSProxyStreamingMixin:
             # ✅ LIVE CDN TOKEN SUBSTITUTION: If the CDN token was refreshed via
             # re-extract on 403, replace the old base URL with the new one so every
             # subsequent segment gets a fresh token without re-extracting each time.
-            stream_key = request.query.get("stream_key")
+            stream_key = stream_key or request.query.get("stream_key")
             if stream_key and stream_key in getattr(self, '_renewed_cdn_tokens', {}):
                 old_b, new_b, new_q = self._renewed_cdn_tokens[stream_key]
                 if stream_url.startswith(old_b):
@@ -859,8 +724,12 @@ class HLSProxyStreamingMixin:
 
             # ✅ Use pooled session for better performance
             if force_direct:
-                session = await self._get_session(url=stream_url)
-                session_proxy = None
+                session, session_proxy = await self._get_proxy_session(
+                    stream_url,
+                    bypass_warp=True,
+                    session_key=stream_key,
+                    force_direct=True,
+                )
                 logger.info(
                     "[Proxy Stream] Using direct session (forced) [%s]",
                     log_context("DIRECT"),
@@ -870,6 +739,7 @@ class HLSProxyStreamingMixin:
                     stream_url,
                     bypass_warp=bypass_warp,
                     forced_proxy=forced_proxy,
+                    session_key=stream_key,
                 )
 
                 # ✅ FIX LOG: Determine correct routing for display
@@ -890,7 +760,13 @@ class HLSProxyStreamingMixin:
                 _seg_name = stream_url.rsplit("/", 1)[-1].split("?")[0]
                 try:
                     return await self._proxy_segment_parallel(
-                        request, stream_url, headers, _seg_name, bypass_warp, forced_proxy
+                        request,
+                        stream_url,
+                        headers,
+                        _seg_name,
+                        bypass_warp,
+                        forced_proxy,
+                        session_key=stream_key,
                     )
                 except _ParallelFallback as _pf:
                     logger.debug(
@@ -924,8 +800,12 @@ class HLSProxyStreamingMixin:
                 )
                 curl_s = None
                 try:
+                    curl_options = _config.get_curl_ipv4_options(session_proxy).get("curl_options")
+                    curl_kwargs = {"impersonate": "chrome124"}
+                    if curl_options:
+                        curl_kwargs["curl_options"] = curl_options
                     curl_s = get_curl_async_session()(
-                        impersonate="chrome124",
+                        **curl_kwargs,
                     )
                     curl_headers = prepare_curl_headers(stream_url, headers)
 
@@ -1033,12 +913,18 @@ class HLSProxyStreamingMixin:
                     extractor_key=request.query.get("extractor_key"),
                 )
                 rot_session, rot_proxy = await self._get_proxy_session(
-                    stream_url, bypass_warp=True, forced_proxy=None,
+                    stream_url,
+                    bypass_warp=True,
+                    forced_proxy=None,
+                    session_key=stream_key,
                 )
                 if not rot_proxy or rot_proxy == old_proxy:
                     await rot_session.close()
                     rot_session, rot_proxy = await self._get_proxy_session(
-                        stream_url, bypass_warp=True, forced_proxy=None,
+                        stream_url,
+                        bypass_warp=True,
+                        forced_proxy=None,
+                        session_key=stream_key,
                     )
 
                 if not rot_proxy or rot_proxy == old_proxy:
@@ -1092,7 +978,10 @@ class HLSProxyStreamingMixin:
                     retry_proxy = None
                     try:
                         retry_session, retry_proxy = await self._get_proxy_session(
-                            stream_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy,
+                            stream_url,
+                            bypass_warp=bypass_warp,
+                            forced_proxy=forced_proxy,
+                            session_key=stream_key,
                         )
                         async with retry_session.get(retry_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as retry_resp:
                             if retry_resp.status not in [200, 206]:
@@ -1341,6 +1230,23 @@ class HLSProxyStreamingMixin:
 
                             # Check if requesting a Media Playlist (Variant)
                             rep_id = request.query.get("rep_id")
+                            # SegmentBase carries the SIDX index and media as
+                            # byte ranges. Expand only the requested variant;
+                            # expanding the master would add an unnecessary
+                            # upstream range request to every startup.
+                            if rep_id and "indexRange" in manifest_content:
+                                from utils.dash_ranges import expand_segment_bases, fetch_range
+
+                                async def _fetch_sidx(url, range_str):
+                                    return await fetch_range(session, url, headers, range_str)
+
+                                manifest_content = await expand_segment_bases(
+                                    manifest_content,
+                                    str(resp.url),
+                                    _fetch_sidx,
+                                    only_rep_id=rep_id,
+                                )
+
                             mpd_params = request.query_string or ""
                             if extractor_key and "extractor_key=" not in mpd_params:
                                 mpd_params = f"{mpd_params}&extractor_key={urllib.parse.quote(extractor_key, safe='')}" if mpd_params else f"extractor_key={urllib.parse.quote(extractor_key, safe='')}"
@@ -1349,7 +1255,8 @@ class HLSProxyStreamingMixin:
 
                             if rep_id:
                                 # Generate Media Playlist (Segments)
-                                hls_playlist = converter.convert_media_playlist(
+                                hls_playlist = await asyncio.to_thread(
+                                    converter.convert_media_playlist,
                                     manifest_content,
                                     rep_id,
                                     proxy_base,
@@ -1363,7 +1270,8 @@ class HLSProxyStreamingMixin:
                                 )
                             else:
                                 # Generate Master Playlist
-                                hls_playlist = converter.convert_master_playlist(
+                                hls_playlist = await asyncio.to_thread(
+                                    converter.convert_master_playlist,
                                     manifest_content,
                                     proxy_base,
                                     stream_url,
@@ -1521,7 +1429,6 @@ class HLSProxyStreamingMixin:
                     active_proxy,
                     extractor_key=request.query.get("extractor_key"),
                 )
-            # Do not restart the kernel tunnel from a stream request.
             if active_proxy and getattr(_shared, 'WARP_PROXY_URL', None) and active_proxy == _shared.WARP_PROXY_URL:
                 warp_healthy, warp_reason = await self._probe_warp(timeout_sec=3)
                 if not warp_healthy:
@@ -1530,6 +1437,7 @@ class HLSProxyStreamingMixin:
                         warp_reason,
                         log_context(active_proxy),
                     )
+                    await self._restart_warp_if_socket_unhealthy(warp_reason)
                 else:
                     logger.debug(
                         "WARP proxy healthy; stream failure is upstream source [%s]",
@@ -1677,12 +1585,23 @@ class HLSProxyStreamingMixin:
         retry_session = None
         need_close = False
         retry_proxy = None
+        stream_session_key = request.query.get("stream_key") or self._stream_key_for_url(
+            request.query.get("orig_url") or fresh_url
+        )
         try:
             if force_direct:
-                retry_session = await self._get_session(url=fresh_url)
+                retry_session, retry_proxy = await self._get_proxy_session(
+                    fresh_url,
+                    bypass_warp=True,
+                    session_key=stream_session_key,
+                    force_direct=True,
+                )
             else:
                 retry_session, retry_proxy = await self._get_proxy_session(
-                    fresh_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy,
+                    fresh_url,
+                    bypass_warp=bypass_warp,
+                    forced_proxy=forced_proxy,
+                    session_key=stream_session_key,
                 )
                 if retry_proxy:
                     need_close = True
@@ -1747,21 +1666,14 @@ class HLSProxyStreamingMixin:
 
         url = request.query.get("url")
         requested_media_type = request.query.get("media_type", "").lower() or "unknown"
-        is_prefetch = request.query.get("prefetch") == "1"
         request_target = url or request.query.get("init_url")
         segment_name = os.path.basename(urllib.parse.urlsplit(request_target).path) if request_target else "unknown"
         decrypt_started = time.monotonic()
         logger.info(
-            "🔓 Decrypt Request: mode=%s track=%s segment=%s",
-            "prefetch" if is_prefetch else "player",
+            "🔓 Decrypt Request: track=%s segment=%s",
             requested_media_type,
             segment_name or "unknown",
         )
-
-        if not is_prefetch:
-            prefetched_response = await self._serve_prefetched_segment(request)
-            if prefetched_response is not None:
-                return prefetched_response
 
         init_url = request.query.get("init_url")
         key = request.query.get("key")
@@ -1779,10 +1691,18 @@ class HLSProxyStreamingMixin:
 
         is_init = request.query.get("is_init") == "1"
         skip_init = request.query.get("skip_init") == "1"
+        init_range = request.query.get("init_range")
+        media_range = request.query.get("media_range")
+
+        for label, value in (("init_range", init_range), ("media_range", media_range)):
+            if value and not re.fullmatch(r"\d+-\d+", value):
+                return web.Response(status=400, text=f"Invalid {label}")
 
         if is_init:
             init_url = url
+            init_range = init_range or media_range
             url = None
+            media_range = None
 
         if not (url or init_url) or not key or not key_id:
             return web.Response(text="Missing url/init_url, key, or key_id", status=400)
@@ -1812,12 +1732,23 @@ class HLSProxyStreamingMixin:
             logger.debug(f"🔍 [Decrypt-DEBUG] bypass_warp={bypass_warp}, forced_proxy={forced_proxy}, warp_param='{request.query.get('warp', 'NOT_FOUND')}'")
             proxy_from_config = get_proxy_for_url(url or init_url, bypass_warp=bypass_warp)
             logger.debug(f"🔍 [Decrypt-DEBUG] get_proxy_for_url returned: {proxy_from_config}")
+            stream_session_key = request.query.get("stream_key")
+            if not stream_session_key:
+                stream_session_key = self._stream_key_for_url(
+                    request.query.get("orig_url")
+                )
             segment_session, segment_proxy = await self._get_proxy_session(
-                url or init_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
+                url or init_url,
+                bypass_warp=bypass_warp,
+                forced_proxy=forced_proxy,
+                session_key=stream_session_key,
             )
             if segment_proxy:
                 logger.info(f"📡 [Decrypt] Using session via proxy: {segment_proxy}")
 
+            fetch_started_at = time.monotonic()
+            fetch_elapsed = 0.0
+            decrypt_elapsed = 0.0
             try:
                 # Parallel download of init and media segment
                 network_errors = ALL_PROXY_ERRORS + (
@@ -1827,14 +1758,30 @@ class HLSProxyStreamingMixin:
                     OSError,
                 )
 
-                async def fetch_part(session, part_url, timeout, label):
+                async def fetch_part(session, part_url, timeout, label, byte_range=None):
                     if not part_url:
                         return b"", False
                     disable_ssl = get_ssl_setting_for_url(part_url)
+                    part_headers = dict(headers)
+                    if byte_range:
+                        part_headers["Range"] = f"bytes={byte_range}"
+                        part_headers["Accept-Encoding"] = "identity"
+                    connector = getattr(session, "connector", None)
+
+                    def session_diagnostics():
+                        acquired = getattr(connector, "_acquired", ()) if connector else ()
+                        waiters = getattr(connector, "_waiters", {}) if connector else {}
+                        return (
+                            f"session={id(session)} closed={getattr(session, 'closed', None)} "
+                            f"connector_closed={getattr(connector, 'closed', None)} "
+                            f"acquired={len(acquired)} waiters={len(waiters)}"
+                        )
+
+                    started_at = time.monotonic()
                     try:
                         async with session.get(
                             part_url,
-                            headers=headers,
+                            headers=part_headers,
                             ssl=not disable_ssl,
                             timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
@@ -1857,9 +1804,11 @@ class HLSProxyStreamingMixin:
                             return None, False
                     except network_errors as error:
                         logger.error(
-                            "❌ Failed to fetch %s: %r [%s]",
+                            "❌ Failed to fetch %s: %r elapsed=%.3fs %s [%s]",
                             label,
                             error,
+                            time.monotonic() - started_at,
+                            session_diagnostics(),
                             request_log_context(
                                 request,
                                 part_url,
@@ -1869,9 +1818,11 @@ class HLSProxyStreamingMixin:
                         return None, True
                     except Exception as error:
                         logger.error(
-                            "❌ Failed to fetch %s: %r [%s]",
+                            "❌ Failed to fetch %s: %r elapsed=%.3fs %s [%s]",
                             label,
                             error,
+                            time.monotonic() - started_at,
+                            session_diagnostics(),
                             request_log_context(
                                 request,
                                 part_url,
@@ -1880,10 +1831,27 @@ class HLSProxyStreamingMixin:
                         )
                         return None, False
 
-                # Parallel fetch
+                # Media requests generated by the MPD converter carry
+                # skip_init=1 because HLS already fetched the EXT-X-MAP.
+                # Do not download the init again: decrypt_segment() also
+                # skips it, so fetching it here only doubles upstream work
+                # and can stall startup on slow CDNs/WARP routes.
+                init_fetch = (
+                    fetch_part(
+                        segment_session,
+                        init_url,
+                        10,
+                        "init segment",
+                        init_range,
+                    )
+                    if init_url and not skip_init
+                    else asyncio.sleep(0, result=(b"", False))
+                )
+
+                # Keep media fetching concurrent with the first init fetch.
                 init_result, segment_result = await asyncio.gather(
-                    fetch_part(segment_session, init_url, 10, "init segment"),
-                    fetch_part(segment_session, url, 15, "segment"),
+                    init_fetch,
+                    fetch_part(segment_session, url, 15, "segment", media_range),
                 )
                 init_content, init_retryable = init_result
                 segment_content, segment_retryable = segment_result
@@ -1897,21 +1865,27 @@ class HLSProxyStreamingMixin:
                     and (init_retryable or segment_retryable)
                 )
                 if can_retry_warp:
-                    await self._invalidate_proxy_session(segment_proxy)
-                    if not await self.is_warp_healthy(timeout_sec=3):
+                    await self._invalidate_proxy_session(
+                        segment_proxy,
+                        session_key=stream_session_key,
+                    )
+                    warp_healthy, warp_reason = await self._probe_warp(timeout_sec=3)
+                    if not warp_healthy:
                         logger.warning(
-                            "WARP health probe failed; retrying without automatic tunnel restart [%s]",
+                            "WARP health probe failed; retrying after socket recovery check [%s]",
                             request_log_context(
                                 request,
                                 url or init_url,
                                 route=safe_log_route(segment_proxy),
                             ),
                         )
+                        await self._restart_warp_if_socket_unhealthy(warp_reason)
 
                     retry_session, retry_proxy = await self._get_proxy_session(
                         url or init_url,
                         bypass_warp=False,
                         forced_proxy=segment_proxy,
+                        session_key=stream_session_key,
                     )
                     try:
                         retry_init, retry_segment = await asyncio.gather(
@@ -1920,12 +1894,14 @@ class HLSProxyStreamingMixin:
                                 init_url if init_retryable else None,
                                 10,
                                 "init segment (WARP retry)",
+                                init_range,
                             ),
                             fetch_part(
                                 retry_session,
                                 url if segment_retryable else None,
                                 15,
                                 "segment (WARP retry)",
+                                media_range,
                             ),
                         )
                     finally:
@@ -1950,9 +1926,65 @@ class HLSProxyStreamingMixin:
                                 route="WARP",
                             ),
                         )
+                elif not segment_proxy and (init_retryable or segment_retryable):
+                    # The upstream is reachable outside EasyProxy, but the
+                    # shared aiohttp DIRECT connector can retain a dead
+                    # keep-alive socket. Recreate only that connector and
+                    # retry on DIRECT; never switch this request to WARP or
+                    # another proxy.
+                    await self._invalidate_direct_session(
+                        url or init_url,
+                        session_key=stream_session_key,
+                    )
+                    _shared.BYPASS_PROXIES_CONTEXT.set(True)
+                    retry_session, retry_proxy = await self._get_proxy_session(
+                        url or init_url,
+                        bypass_warp=True,
+                        forced_proxy=None,
+                        session_key=stream_session_key,
+                    )
+                    try:
+                        retry_init, retry_segment = await asyncio.gather(
+                            fetch_part(
+                                retry_session,
+                                init_url if init_retryable else None,
+                                10,
+                                "init segment (DIRECT retry)",
+                                init_range,
+                            ),
+                            fetch_part(
+                                retry_session,
+                                url if segment_retryable else None,
+                                15,
+                                "segment (DIRECT retry)",
+                                media_range,
+                            ),
+                        )
+                    finally:
+                        if retry_session and not retry_session.closed:
+                            await retry_session.close()
+
+                    if init_retryable and retry_init[0] is not None:
+                        init_content = retry_init[0]
+                    if segment_retryable and retry_segment[0] is not None:
+                        segment_content = retry_segment[0]
+                    if (
+                        (not init_retryable or init_content is not None)
+                        and (not segment_retryable or segment_content is not None)
+                    ):
+                        logger.warning(
+                            "Recovered ClearKey request through a fresh DIRECT session [%s]",
+                            request_log_context(
+                                request,
+                                url or init_url,
+                                route="DIRECT",
+                            ),
+                        )
             finally:
                 if segment_session and not segment_session.closed:
                     await segment_session.close()
+
+            fetch_elapsed = time.monotonic() - fetch_started_at
 
             if init_content is None and init_url:
                 logger.error(
@@ -2001,9 +2033,17 @@ class HLSProxyStreamingMixin:
                 # Decripta con PyCryptodome
                 # Decrypt in thread pool to avoid blocking event loop
                 loop = asyncio.get_event_loop()
+                decrypt_started_at = time.monotonic()
                 combined_content = await loop.run_in_executor(
-                    None, decrypt_segment, init_content, segment_content, key_id, key, skip_init
+                    _CLEARKEY_EXECUTOR,
+                    decrypt_segment,
+                    init_content,
+                    segment_content,
+                    key_id,
+                    key,
+                    skip_init,
                 )
+                decrypt_elapsed = time.monotonic() - decrypt_started_at
 
             # Serve raw decrypted fMP4.  DASH uses `.m4s` for both tracks, so
             # preserve the track kind explicitly for Safari's native demuxer.
@@ -2015,9 +2055,11 @@ class HLSProxyStreamingMixin:
             content_type = "audio/mp4" if media_type == "audio" else "video/mp4"
 
             logger.info(
-                "✅ [Decrypt] Completed: track=%s bytes=%d elapsed=%.2fs [%s]",
+                "✅ [Decrypt] Completed: track=%s bytes=%d fetch=%.2fs decrypt=%.2fs total=%.2fs [%s]",
                 media_type,
                 len(ts_content),
+                fetch_elapsed,
+                decrypt_elapsed,
                 time.monotonic() - decrypt_started,
                 request_log_context(
                     request,
@@ -2025,9 +2067,6 @@ class HLSProxyStreamingMixin:
                     route=safe_log_route(segment_proxy or forced_proxy),
                 ),
             )
-
-            if not is_prefetch:
-                self._schedule_next_segment_prefetch(request)
 
             # Invia Risposta
             return web.Response(

@@ -1,3 +1,4 @@
+import re
 import time
 import aiohttp
 from urllib.parse import urljoin, urlparse, unquote
@@ -104,9 +105,18 @@ class HLSProxyDashMixin:
                 or "\\" in decoded_path or urlparse(decoded_path).scheme
                 or any(part in (".", "..") for part in decoded_path.split("/"))):
             return web.Response(status=400, text="Invalid DASH segment path")
-        segment_url = urljoin(base_url, path)
-        if getattr(request, "query_string", ""):
-            segment_url += "?" + request.query_string
+        resource_url = routing.get("resource_url")
+        if resource_url:
+            parsed_resource = urlparse(resource_url)
+            if parsed_resource.scheme not in {"http", "https"} or not parsed_resource.netloc:
+                return web.Response(status=400, text="Invalid DASH resource URL")
+            segment_url = resource_url
+        else:
+            # Backward compatibility for tokens generated before resource_url
+            # was sealed into the state.
+            segment_url = urljoin(base_url, path)
+            if getattr(request, "query_string", ""):
+                segment_url += "?" + request.query_string
 
         # Parse clearkey into KID and KEY for decrypter
         kid, key = None, None
@@ -118,8 +128,23 @@ class HLSProxyDashMixin:
             key = ",".join(pair[1] for pair in pairs)
 
         try:
-            # Check if it's an initialization segment
-            is_init = segment_url == routing.get("init_url")
+            client_range = getattr(request, "headers", {}).get("Range")
+            init_url = routing.get("init_url")
+            init_range = routing.get("init_range")
+
+            def _matches_range(r1: str | None, r2: str | None) -> bool:
+                if not r1 or not r2:
+                    return False
+                p1 = r1.lower().replace("bytes=", "").strip()
+                p2 = r2.lower().replace("bytes=", "").strip()
+                return p1 == p2
+
+            if init_range and client_range:
+                is_init = (segment_url == init_url and _matches_range(client_range, init_range))
+            elif init_range and not client_range:
+                is_init = (segment_url == init_url)
+            else:
+                is_init = (segment_url == init_url)
 
             # Fetch segment
             extractor_key = routing.get("extractor_key")
@@ -136,39 +161,92 @@ class HLSProxyDashMixin:
             if hasattr(self, "_touch_extractor_activity"):
                 self._touch_extractor_activity(extractor_key, routing.get("stream_key"))
 
-            _session, _ = await self._get_proxy_session(
-                segment_url, bypass_warp=bypass_warp,
-                forced_proxy=forced_proxy,
-            )
-            if not clearkey and getattr(request, "headers", {}).get("Range"):
-                headers["Range"] = request.headers["Range"]
+            session_kwargs = {
+                "bypass_warp": bypass_warp,
+                "forced_proxy": forced_proxy,
+            }
+            if routing.get("stream_key"):
+                session_kwargs["session_key"] = routing["stream_key"]
+            _session, _ = await self._get_proxy_session(segment_url, **session_kwargs)
+            if client_range:
+                headers["Range"] = client_range
+            elif is_init and init_range:
+                headers["Range"] = f"bytes={init_range}"
+
             async with _session.get(segment_url, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status not in [200, 206]:
                     return web.Response(status=resp.status)
 
-                # ClearKey path: must read full segment for decryption
+                # ClearKey path: must read segment for decryption
                 if kid and key:
                     if not decrypt_segment:
                         return web.Response(status=502, text="DASH decryption unavailable")
                     content = await resp.read()
+                    resp_content_type = getattr(resp, "content_type", "video/mp4") or "video/mp4"
+                    resp_headers = getattr(resp, "headers", {})
                     if is_init:
                         decrypted = decrypt_segment(content, b"", kid, key)
-                        return web.Response(body=decrypted, content_type=resp.content_type,
+                        response_headers = {
+                            "Content-Type": resp_content_type,
+                            "Access-Control-Allow-Origin": "*",
+                            "Accept-Ranges": "bytes",
+                        }
+                        if client_range:
+                            m = re.search(r"bytes=(\d+)-", client_range)
+                            start_byte = int(m.group(1)) if m else 0
+                            response_headers["Content-Range"] = f"bytes {start_byte}-{start_byte + len(decrypted) - 1}/*"
+                            return web.Response(body=decrypted, status=206, headers=response_headers)
+                        return web.Response(body=decrypted, content_type=resp_content_type,
                                             headers={"Access-Control-Allow-Origin": "*"})
-                    init_url = routing.get("init_url")
+
+                    # Non-media chunk (e.g. SIDX index box): pass through untouched
+                    is_sidx = len(content) >= 8 and (content[4:8] == b"sidx" or (len(content) >= 16 and content[8:12] == b"sidx"))
+                    if is_sidx:
+                        response_headers = {
+                            "Content-Type": resp_content_type,
+                            "Access-Control-Allow-Origin": "*",
+                            "Accept-Ranges": "bytes",
+                        }
+                        if "Content-Range" in resp_headers:
+                            response_headers["Content-Range"] = resp_headers["Content-Range"]
+                        return web.Response(body=content, status=resp.status, headers=response_headers)
 
                     if init_url:
                         try:
-                            _init_session = _session
-                            async with _init_session.get(init_url, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as init_resp:
-                                if init_resp.status in [200, 206]:
-                                    init_segment = await init_resp.read()
-                                    try:
-                                        decrypted = decrypt_segment(init_segment or b"", content, kid, key, skip_init=True)
-                                        return web.Response(body=decrypted, content_type=resp.content_type,
-                                                            headers={"Access-Control-Allow-Origin": "*"})
-                                    except Exception as e:
-                                        logger.warning(f"DASH decryption failed for {path}: {e}")
+                            init_cache_key = f"{init_url}:{init_range}"
+                            init_segment = getattr(self, "_dash_init_cache", {}).get(init_cache_key)
+                            if not init_segment:
+                                _init_session = _session
+                                init_headers = dict(headers)
+                                if init_range:
+                                    init_headers["Range"] = f"bytes={init_range}"
+                                else:
+                                    init_headers.pop("Range", None)
+                                async with _init_session.get(init_url, headers=init_headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as init_resp:
+                                    if init_resp.status in [200, 206]:
+                                        init_segment = await init_resp.read()
+                                        if not hasattr(self, "_dash_init_cache"):
+                                            self._dash_init_cache = {}
+                                        if len(self._dash_init_cache) > 50:
+                                            self._dash_init_cache.clear()
+                                        self._dash_init_cache[init_cache_key] = init_segment
+                            if init_segment:
+                                try:
+                                    decrypted = decrypt_segment(init_segment, content, kid, key, skip_init=True)
+                                    response_headers = {
+                                        "Content-Type": resp_content_type,
+                                        "Access-Control-Allow-Origin": "*",
+                                        "Accept-Ranges": "bytes",
+                                    }
+                                    if client_range:
+                                        m = re.search(r"bytes=(\d+)-", client_range)
+                                        start_byte = int(m.group(1)) if m else 0
+                                        response_headers["Content-Range"] = f"bytes {start_byte}-{start_byte + len(decrypted) - 1}/*"
+                                        return web.Response(body=decrypted, status=206, headers=response_headers)
+                                    return web.Response(body=decrypted, content_type=resp_content_type,
+                                                        headers={"Access-Control-Allow-Origin": "*"})
+                                except Exception as e:
+                                    logger.warning(f"DASH decryption failed for {path}: {e}")
                         except Exception as e:
                             logger.debug(f"DASH init re-fetch failed for {path}: {e}")
 
@@ -305,7 +383,10 @@ class HLSProxyDashMixin:
                 logger.debug("Using direct session for AES key request (forced)")
             else:
                 session, proxy_used = await self._get_proxy_session(
-                    key_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
+                    key_url,
+                    bypass_warp=bypass_warp,
+                    forced_proxy=forced_proxy,
+                    session_key=request.query.get("stream_key"),
                 )
                 session_need_close = proxy_used is not None
                 if proxy_used:
@@ -427,7 +508,12 @@ class HLSProxyDashMixin:
                                 )
                                 fallback_session = None
                                 try:
-                                    fallback_session, _ = await self._get_proxy_session(key_url, bypass_warp=bypass_warp, forced_proxy=new_proxy)
+                                    fallback_session, _ = await self._get_proxy_session(
+                                        key_url,
+                                        bypass_warp=bypass_warp,
+                                        forced_proxy=new_proxy,
+                                        session_key=request.query.get("stream_key"),
+                                    )
                                     async with fallback_session.get(key_url, headers=headers, ssl=not disable_ssl, allow_redirects=False, timeout=10) as rot_resp:
                                         if rot_resp.status in (200, 206):
                                             key_data = await rot_resp.read()
@@ -507,7 +593,12 @@ class HLSProxyDashMixin:
                         )
                         fallback_session = None
                         try:
-                            fallback_session, _ = await self._get_proxy_session(key_url, bypass_warp=bypass_warp, forced_proxy=new_proxy)
+                            fallback_session, _ = await self._get_proxy_session(
+                                key_url,
+                                bypass_warp=bypass_warp,
+                                forced_proxy=new_proxy,
+                                session_key=request.query.get("stream_key"),
+                            )
                             async with fallback_session.get(key_url, headers=headers, ssl=not disable_ssl, allow_redirects=False, timeout=10) as rot_resp:
                                 if rot_resp.status in (200, 206):
                                     key_data = await rot_resp.read()

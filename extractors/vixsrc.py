@@ -71,6 +71,7 @@ class VixSrcExtractor:
         self.request_headers = request_headers
         self.base_headers = self._default_headers()
         self.session = None
+        self._route_sessions = {}
         self.session_proxy = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self.proxies = []
@@ -468,8 +469,12 @@ class VixSrcExtractor:
             if proxy:
                 request_kwargs["proxies"] = {"http": proxy, "https": proxy}
             try:
+                curl_options = _cfg.get_curl_ipv4_options(proxy).get("curl_options")
+                session_kwargs = {"impersonate": imp}
+                if curl_options:
+                    session_kwargs["curl_options"] = curl_options
                 async with CurlAsyncSession(
-                    impersonate=imp,
+                    **session_kwargs,
                 ) as session:
                     resp = await session.get(
                         url,
@@ -623,14 +628,15 @@ class VixSrcExtractor:
         self.last_used_proxy = proxy
         self.last_used_direct = proxy is None
 
-        if self.session is not None and not self.session.closed and self.session_proxy != proxy:
-            await self.session.close()
-            self.session = None
-
-        if self.session is None or self.session.closed:
-            self.session_proxy = proxy
-            self.session = self._build_session_for_proxy(proxy)
-        return self.session
+        # No await between lookup and publication: concurrent borrowers cannot
+        # overwrite a newly created session while an old one is closing.
+        session = self._route_sessions.get(proxy)
+        if session is None or session.closed:
+            session = self._build_session_for_proxy(proxy)
+            self._route_sessions[proxy] = session
+        self.session_proxy = proxy
+        self.session = session
+        return session
 
     async def _make_robust_request(
         self, url: str, headers: dict = None, retries: int = 2, initial_delay: int = 2, forced_proxy: str | None = None
@@ -639,22 +645,17 @@ class VixSrcExtractor:
         self._load_cached_solver_state(url)
         final_headers = self._apply_solver_headers(headers or {})
         last_error = None
+        request_proxy = None
 
         for attempt in range(retries):
             try:
                 if last_error is not None:
-                    # Close session and force a different proxy on retry
-                    try:
-                        await self.session.close()
-                    except Exception:
-                        pass
-                    self.session = None
-                    if self.session_proxy:
-                        mark_proxy_dead(self.session_proxy)
-                        self.session_proxy = None
+                    # Failed connections are discarded by aiohttp; do not close
+                    # a session that another request may still be using.
                     forced_proxy = None  # Don't reuse dead proxy
 
                 session = await self._get_session(url, forced_proxy=forced_proxy)
+                request_proxy = self.session_proxy
                 logger.info("Attempt %s/%s for URL: %s", attempt + 1, retries, url)
 
                 async with session.get(url, headers=final_headers, timeout=aiohttp.ClientTimeout(total=15, connect=10)) as response:
@@ -672,7 +673,7 @@ class VixSrcExtractor:
                             return await self._flaresolverr_response(
                                 url,
                                 headers=final_headers or self._default_headers(),
-                                forced_proxy=forced_proxy or self.session_proxy,
+                                forced_proxy=forced_proxy or request_proxy,
                             )
                         except Exception as solver_exc:
                             logger.warning("FlareSolverr failed for %s: %s", url, solver_exc)
@@ -724,16 +725,8 @@ class VixSrcExtractor:
                     "%s error attempt %s for %s: %s", err_type, attempt + 1, url, str(e)
                 )
 
-                # Reset session
-                if self.session and not self.session.closed:
-                    try:
-                        await self.session.close()
-                    except Exception:
-                        pass
-                self.session = None
-                
-                if self.session_proxy:
-                    mark_proxy_dead(self.session_proxy)
+                if request_proxy:
+                    mark_proxy_dead(request_proxy)
 
                 if is_proxy_err and SELECTED_PROXY_CONTEXT.get() and not STRICT_PROXY_CONTEXT.get():
                     logger.info("Clearing sticky proxy context due to ProxyError")
@@ -1287,11 +1280,13 @@ class VixSrcExtractor:
 
     async def close(self):
         """Chiude definitivamente la sessione."""
-        if self.session and not self.session.closed:
-            try:
-                await self.session.close()
-            except Exception:
-                pass
-            self.session = None
-            self.session_proxy = None
+        sessions = set(self._route_sessions.values())
+        if self.session is not None:
+            sessions.add(self.session)
+        for session in sessions:
+            if not session.closed:
+                await session.close()
+        self._route_sessions.clear()
+        self.session = None
+        self.session_proxy = None
         await shutdown_flare_solver()

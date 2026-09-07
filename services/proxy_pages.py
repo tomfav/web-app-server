@@ -248,9 +248,6 @@ class HLSProxyPagesMixin:
 
     async def handle_api_info(self, request):
         """Endpoint API che restituisce le informazioni sul server in formato JSON."""
-        # Refresh version on API call
-        await self._refresh_latest_version()
-
         stats = get_system_stats()
         active_streams = _shared.get_active_streams()
 
@@ -288,6 +285,9 @@ class HLSProxyPagesMixin:
                     if s and not s.closed and hasattr(s, '_connector') and hasattr(s._connector, '_conns')
                 ),
                 "parallel_fetch": dict(getattr(self, "_parallel_fetch_stats", {})),
+                "cpu": stats.get("cpu", {}),
+                "proxy_cpu": stats.get("proxy_cpu", {}),
+                "net": stats.get("net", {}),
             },
             "memory": {
                 **stats.get("proxy_ram", {}),
@@ -1270,6 +1270,7 @@ class HLSProxyPagesMixin:
 
         if enable:
             logger.info("WARP enabled via admin panel")
+            self._warp_status_checked_at = 0.0
             result = await self.reconnect_warp()
             if result.get("status") != "ok":
                 logger.warning(f"WARP enable failed: {result.get('message')}")
@@ -1277,6 +1278,9 @@ class HLSProxyPagesMixin:
         else:
             logger.info("WARP disabled via admin panel")
             await self._stop_warp_proxy()
+            self.warp_status = "Disabled"
+            self._warp_ip = ""
+            self._warp_status_checked_at = time.monotonic()
 
         return web.json_response({"status": "ok", "warp": "enabled" if enable else "disabled"})
 

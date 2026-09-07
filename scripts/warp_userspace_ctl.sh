@@ -23,7 +23,23 @@ read_pid() {
 }
 
 write_wireproxy_config() {
-    cp "$CONFIG_FILE" "$WIREPROXY_CONFIG"
+    # Keep WARP itself IPv4-only. The generated wgcf profile is dual-stack;
+    # retaining ::/0 makes wireproxy occasionally select an IPv6 egress even
+    # when the application requested an IPv4 route.
+    sed -E '/^(Address|AllowedIPs|DNS) = / {
+        s/, *[^, ]*:[^, ]*//g
+    }' "$CONFIG_FILE" > "$WIREPROXY_CONFIG"
+
+    # Resolve the WireGuard endpoint to an IPv4 address as well. This keeps
+    # the control-plane handshake from selecting an IPv6 endpoint implicitly.
+    endpoint=$(sed -n 's/^Endpoint = //p' "$WIREPROXY_CONFIG" | head -n 1)
+    endpoint_host=${endpoint%:*}
+    endpoint_port=${endpoint##*:}
+    endpoint_ipv4=$(getent ahostsv4 "$endpoint_host" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    if [ -n "$endpoint_ipv4" ] && [ -n "$endpoint_port" ]; then
+        sed -i "s/^Endpoint = .*/Endpoint = ${endpoint_ipv4}:${endpoint_port}/" "$WIREPROXY_CONFIG"
+    fi
+
     printf '\n[Socks5]\nBindAddress = %s\n' "$SOCKS_ADDR" >> "$WIREPROXY_CONFIG"
     chmod 600 "$WIREPROXY_CONFIG"
 }
@@ -94,8 +110,8 @@ probe_warp() {
         echo "WARP probe: Cloudflare did not report warp=on/plus." >&2
         return 1
     }
-    printf '%s\n' "$trace" | grep -Eq '^ip=[^[:space:]]+$' || {
-        echo "WARP probe: Cloudflare did not return an egress IP." >&2
+    printf '%s\n' "$trace" | grep -Eq '^ip=[0-9.]+$' || {
+        echo "WARP probe: egress is not IPv4-only." >&2
         return 1
     }
 }

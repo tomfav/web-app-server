@@ -36,6 +36,7 @@ class DLStreamsExtractor:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
         }
         self.session = None
+        self._route_sessions = {}
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self.proxies = proxies or []
         self.bypass_warp_active = bypass_warp
@@ -233,16 +234,11 @@ class DLStreamsExtractor:
                 f"[{self._route_diagnostic(target_url)}]"
             )
         
-        # If we have an existing session, check if its proxy matches what we need now
-        if self.session and not self.session.closed:
-            # We store the proxy used for the current session in a custom attribute
-            session_proxy = getattr(self, "_session_proxy", "NOT_SET")
-            if session_proxy == proxy_url:
-                return self.session
-            else:
-                logger.debug("DLStreams: Proxy choice changed (was %s, now %s). Closing old session.", session_proxy, proxy_url)
-                await self.session.close()
-                self.session = None
+        session = self._route_sessions.get(proxy_url)
+        if session is not None and not session.closed:
+            self.session = session
+            self._session_proxy = proxy_url
+            return session
 
         # DLStreams keys and segments appear to be tied to a consistent
         # egress/session context. Using rotating/global proxies here can
@@ -262,6 +258,7 @@ class DLStreamsExtractor:
             cookie_jar=aiohttp.CookieJar(unsafe=True),
         )
         self._session_proxy = proxy_url # Store for future comparison
+        self._route_sessions[proxy_url] = self.session
         return self.session
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
@@ -320,6 +317,11 @@ class DLStreamsExtractor:
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
         self._inflight_extract_tasks.clear()
-        if self.session and not self.session.closed:
-            await self.session.close()
-            self.session = None
+        sessions = set(self._route_sessions.values())
+        if self.session is not None:
+            sessions.add(self.session)
+        for session in sessions:
+            if not session.closed:
+                await session.close()
+        self._route_sessions.clear()
+        self.session = None

@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     tar \
     nodejs \
+    node-undici \
     netcat-openbsd \
     procps \
     ffmpeg \
@@ -83,6 +84,12 @@ ENV FLARESOLVERR_LOG_LEVEL=error
 
 # Copia esplicita
 COPY . .
+
+# Node's ESM resolver does not search Debian's global module directory for a
+# bare import. Expose the apt-installed undici package from the app module
+# tree so the VidFast runner can use HTTP ProxyAgent when WARP is selected.
+RUN mkdir -p /app/node_modules \
+    && ln -s /usr/share/nodejs/undici /app/node_modules/undici
 
 # FlareSolverr uses this Docker marker to avoid downloading an
 # undetected_chromedriver binary for the wrong CPU architecture. Debian's

@@ -84,17 +84,26 @@ class ManifestRewriter:
         root = ET.fromstring(manifest_content)
         namespace = root.tag.split("}")[0] + "}" if "}" in root.tag else ""
 
-        def relay(absolute, init_url=None):
+        def relay(absolute, init_url=None, init_range=None):
             parsed = urllib.parse.urlsplit(absolute)
-            directory, tail = parsed.path.rsplit("/", 1)
-            base_directory = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, directory + "/", "", ""))
+            path = parsed.path or "/"
+            if "/" in path:
+                directory, tail = path.rsplit("/", 1)
+            else:
+                directory, tail = "", path
+            base_dir = (directory + "/") if not directory.endswith("/") else directory
+            base_directory = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, base_dir, "", ""))
             if parsed.query:
                 tail += "?" + parsed.query
             token = _encode_dash_state(base_directory, stream_headers, clearkey_param,
-                init_url=init_url, proxy=forced_proxy, bypass_warp=bypass_warp,
+                resource_url=absolute, init_url=init_url, init_range=init_range,
+                proxy=forced_proxy, bypass_warp=bypass_warp,
                 bypass_proxies=bypass_proxies, extractor_key=extractor_key,
                 stream_key=stream_key)
-            return f"{proxy_base}/proxy/mpd/segment/{token}/{tail}"
+            # Keep the token path opaque: source query parameters belong in
+            # authenticated state, not in the public relay URL query string.
+            safe_tail = urllib.parse.quote(tail or "segment.mp4", safe="._-~$")
+            return f"{proxy_base}/proxy/mpd/segment/{token}/{safe_tail}"
 
         def walk(node, base, inherited=None):
             bases = node.findall(namespace + "BaseURL")
@@ -123,18 +132,20 @@ class ManifestRewriter:
                     ET.SubElement(node, namespace + "BaseURL").text = relay(base)
                 elif effective.tag != namespace + "SegmentTemplate":
                     init = effective.find(namespace + "Initialization")
-                    init_url = urljoin(base, init.get("sourceURL", "")) if init is not None else None
-                    if clearkey_param and (not init_url or effective.tag == namespace + "SegmentBase"
-                            or any("range" in k.lower() for element in effective.iter() for k in element.attrib)):
-                        raise ValueError("ClearKey byte-range DASH is unsupported; use full-segment HLS")
+                    init_url = urljoin(base, init.get("sourceURL", "") or "") if init is not None else None
+                    if clearkey_param and not init_url:
+                        init_url = base
+                    init_range = init.get("range") if init is not None else None
+                    if clearkey_param and init is None:
+                        raise ValueError("ClearKey DASH requires initialization metadata")
                     if init is not None and init.get("sourceURL"):
-                        init.set("sourceURL", relay(init_url, init_url))
+                        init.set("sourceURL", relay(init_url, init_url, init_range))
                     for segment in effective.findall(namespace + "SegmentURL"):
                         for attr in ("media", "index"):
                             if segment.get(attr):
-                                segment.set(attr, relay(urljoin(base, segment.get(attr)), init_url))
+                                segment.set(attr, relay(urljoin(base, segment.get(attr)), init_url, init_range))
                     if effective.tag == namespace + "SegmentBase" or (init is not None and not init.get("sourceURL")):
-                        ET.SubElement(node, namespace + "BaseURL").text = relay(base, init_url)
+                        ET.SubElement(node, namespace + "BaseURL").text = relay(base, init_url, init_range)
                     node.append(effective)
                 else:
                     rewrite_template(node, effective, base)
@@ -150,13 +161,14 @@ class ManifestRewriter:
                         "$Bandwidth$", node.get("bandwidth", ""))
                 init = effective.get("initialization")
                 init_url = urljoin(base, expand(init)) if init else None
+                init_range = effective.get("initializationRange") or effective.get("range")
                 if clearkey_param and not init_url:
                     raise ValueError("ClearKey DASH requires explicit initialization")
                 for attr in ("media", "initialization"):
                     if not effective.get(attr):
                         continue
                     absolute = urljoin(base, expand(effective.get(attr)))
-                    effective.set(attr, relay(absolute, init_url))
+                    effective.set(attr, relay(absolute, init_url, init_range))
                 node.append(effective)
 
         walk(root, mpd_url)

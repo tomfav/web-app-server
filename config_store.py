@@ -43,7 +43,9 @@ DEFAULT_CONFIG = {
     "global_proxies": [],
     "transport_routes": [],
     "extractor_proxies": {},
-    "warp_off_extractors": [],
+    # Cinejoy's gateway rejects Cloudflare WARP egress (HTTP 403). Keep its
+    # resolver direct unless the user explicitly supplies another proxy route.
+    "warp_off_extractors": ["cinejoy"],
     "proxy_off_extractors": [],
     "proxy_exclude_domains": [],
     "dvr_enabled": False,
