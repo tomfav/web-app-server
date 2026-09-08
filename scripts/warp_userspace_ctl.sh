@@ -2,7 +2,7 @@
 set -eu
 
 PID_FILE="/tmp/easyproxy-warp/wireproxy.pid"
-CONFIG_FILE="/etc/wireguard/wg0.conf"
+CONFIG_FILE="${WARP_CONFIG_FILE:-/etc/wireguard/wg0.conf}"
 WIREPROXY_CONFIG="/tmp/easyproxy-warp/wireproxy.conf"
 LOG_FILE="/var/log/wireproxy.log"
 WIREPROXY_BIN="/usr/local/bin/wireproxy"
@@ -23,9 +23,8 @@ read_pid() {
 }
 
 write_wireproxy_config() {
-    # Keep WARP itself IPv4-only. The generated wgcf profile is dual-stack;
-    # retaining ::/0 makes wireproxy occasionally select an IPv6 egress even
-    # when the application requested an IPv4 route.
+    # Keep WARP itself IPv4-only. Remove any IPv6 fields even when a manually
+    # supplied/generated profile contains them.
     sed -E '/^(Address|AllowedIPs|DNS) = / {
         s/, *[^, ]*:[^, ]*//g
     }' "$CONFIG_FILE" > "$WIREPROXY_CONFIG"

@@ -27,6 +27,15 @@ from config import (
     reset_memory_profiler,
 )
 
+_SPEEDTEST_LOCK = asyncio.Lock()
+_PROXY_ENV_KEYS = (
+    "ALL_PROXY", "all_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "SOCKS_PROXY", "socks_proxy",
+    "NO_PROXY", "no_proxy",
+)
+
 class HLSProxyPagesMixin:
 
     async def handle_playlist_request(self, request):
@@ -1369,19 +1378,18 @@ class HLSProxyPagesMixin:
             global_proxies = config_store.get("global_proxies", [])
             if global_proxies:
                 routes.append({"name": "Via Proxy", "proxy": global_proxies[0]})
-            from concurrent.futures import ThreadPoolExecutor
-            loop = asyncio.get_event_loop()
-            with ThreadPoolExecutor(max_workers=len(routes)) as pool:
-                futures = [loop.run_in_executor(pool, self._run_speedtest, r["proxy"]) for r in routes]
-                results = await asyncio.gather(*futures, return_exceptions=True)
             output = []
-            for i, r in enumerate(routes):
-                res = results[i]
-                if isinstance(res, Exception):
-                    output.append({"name": r["name"], "error": str(res)})
-                else:
-                    res["name"] = r["name"]
-                    output.append(res)
+            # Run routes one at a time. Concurrent Ookla tests compete for the
+            # same uplink/downlink and make the displayed comparison invalid.
+            async with _SPEEDTEST_LOCK:
+                for route in routes:
+                    try:
+                        res = await asyncio.to_thread(self._run_speedtest, route["proxy"])
+                    except Exception as exc:
+                        output.append({"name": route["name"], "error": str(exc)})
+                    else:
+                        res["name"] = route["name"]
+                        output.append(res)
             return web.json_response({"results": output})
         except Exception as e:
             logger.error(f"Speedtest failed: {e}")
@@ -1462,15 +1470,21 @@ class HLSProxyPagesMixin:
         import os as _os
         exe = self._ensure_speedtest_exe()
         try:
-            env = None
+            # Give every route an isolated proxy environment. In particular,
+            # DIRECT must not inherit a proxy from the container/VPS shell.
+            env = _os.environ.copy()
+            for key in _PROXY_ENV_KEYS:
+                env.pop(key, None)
             if proxy_url:
-                env = _os.environ.copy()
-                # Socks5h per WARP, HTTP per proxy normali
-                if "socks5" in proxy_url:
+                scheme = proxy_url.split(":", 1)[0].lower()
+                if scheme.startswith("socks"):
                     env["ALL_PROXY"] = proxy_url
+                    env["all_proxy"] = proxy_url
                 else:
                     env["HTTPS_PROXY"] = proxy_url
                     env["HTTP_PROXY"] = proxy_url
+                    env["https_proxy"] = proxy_url
+                    env["http_proxy"] = proxy_url
             result = subprocess.run(
                 [exe, "--format", "json", "--accept-license", "--accept-gdpr"],
                 capture_output=True, text=True, timeout=60, env=env

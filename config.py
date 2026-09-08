@@ -46,7 +46,7 @@ _SOCKET_CHECK_EXECUTOR = ThreadPoolExecutor(
 )
 
 
-APP_VERSION = "2.11.38"
+APP_VERSION = "2.11.42"
 
 _MEMORY_PROFILE_FRAMES = 15
 _memory_profile_baseline = None
@@ -193,7 +193,7 @@ LOG_LEVEL = LOG_LEVEL_MAP.get(LOG_LEVEL_STR, logging.WARNING)
 PROXY_TEST_TIMEOUT = 10
 cpu_cores = os.cpu_count() or 4
 PROXY_TEST_CONCURRENCY = 10 if cpu_cores == 1 else min(100, max(30, cpu_cores * 15))
-# Keep WARP as a normal dual-stack SOCKS route. The generated wgcf profile and
+# Keep WARP as a normal SOCKS route. The generated WireGuard profile and
 # wireproxy decide which address family is usable for each destination.
 WARP_PROXY_URL = "socks5://127.0.0.1:1080"
 # Monotonic timestamp of the last real WARP connector use. Health probes do
@@ -1145,7 +1145,7 @@ def get_system_stats():
             return "alighieri"
         if "wgx" in value:
             return "wgx"
-        if "warp" in value or "wgcf" in value:
+        if "warp" in value:
             return "warp"
         return "other"
 

@@ -11,6 +11,8 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
+    jq \
+    wireguard-tools \
     tar \
     nodejs \
     node-undici \
@@ -37,18 +39,20 @@ RUN set -eux; \
     rm -rf /opt/flaresolverr/.git
 
 # WARP config generator and stable userspace SOCKS5 relay.
-ARG WGCF_VERSION=2.2.29
-ARG WIREPROXY_VERSION=1.1.2
+# The generator is pinned so image rebuilds remain reproducible. It is used
+# only on first startup when /data/warp.conf does not exist.
+ARG WARP_GENERATOR_COMMIT=d4616f154d654d5c159c193432159240c96614bb
+ARG WIREPROXY_VERSION=1.1.3
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
-        amd64) wgcf_arch="amd64"; wireproxy_arch="amd64" ;; \
-        arm64) wgcf_arch="arm64"; wireproxy_arch="arm64" ;; \
-        armhf) wgcf_arch="armv7"; wireproxy_arch="arm" ;; \
-        *) echo "Unsupported architecture for wgcf/wireproxy: $arch" >&2; exit 1 ;; \
+        amd64) wireproxy_arch="amd64" ;; \
+        arm64) wireproxy_arch="arm64" ;; \
+        armhf) wireproxy_arch="arm" ;; \
+        *) echo "Unsupported architecture for wireproxy: $arch" >&2; exit 1 ;; \
     esac; \
-    curl -fL "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${wgcf_arch}" -o /usr/local/bin/wgcf; \
-    chmod +x /usr/local/bin/wgcf; \
+    curl -fL "https://raw.githubusercontent.com/lanrat/wireguard-warp-generator/${WARP_GENERATOR_COMMIT}/scripts/warp-register.sh" -o /usr/local/bin/warp-register; \
+    chmod 700 /usr/local/bin/warp-register; \
     curl -fL "https://github.com/windtf/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_${wireproxy_arch}.tar.gz" -o /tmp/wireproxy.tar.gz; \
     curl -fL "https://github.com/windtf/wireproxy/releases/download/v${WIREPROXY_VERSION}/checksums.txt" -o /tmp/wireproxy.checksums; \
     checksum="$(awk -v asset="wireproxy_linux_${wireproxy_arch}.tar.gz" '$2 == asset { print $1 }' /tmp/wireproxy.checksums)"; \

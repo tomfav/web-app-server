@@ -349,7 +349,10 @@ class HLSProxyStreamingMixin:
             orig_url = request.query.get("orig_url", "")
             extractor_key = request.query.get("extractor_key", "")
             log_context = lambda route=None: request_log_context(
-                request, segment_url, route=safe_log_route(route)
+                request,
+                segment_url,
+                route=safe_log_route(route),
+                extractor=extractor_key or None,
             )
             if "lulustream" in orig_url or "luluvdo" in orig_url or extractor_key == "lulustream":
                 headers.pop("accept-language", None)
@@ -593,6 +596,7 @@ class HLSProxyStreamingMixin:
                 request,
                 target or stream_url,
                 route=safe_log_route(route),
+                extractor=extractor_key or None,
             )
 
         try:
