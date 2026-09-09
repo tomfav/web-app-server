@@ -5,14 +5,6 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-_VIXSRC_WARP_EXCLUDES = {
-    "vixcloud.cc",
-    "*.vixcloud.cc",
-    "vixsrc.to",
-    "*.vixsrc.to",
-    "*.vix-content.net",
-}
-
 # Docker keeps its persistent volume at /data.  Native Windows runs should
 # keep the same layout inside the EasyProxy checkout instead of writing to
 # the drive root (C:\data).
@@ -61,22 +53,6 @@ _lock = threading.Lock()
 _config_data = None
 
 
-def _remove_vixsrc_warp_excludes(config):
-    changed = False
-    for key in ("warp_exclude_domains", "warp_exclude_domains_custom"):
-        values = config.get(key, [])
-        if not isinstance(values, list):
-            continue
-        filtered = [
-            value for value in values
-            if str(value).strip().lower() not in _VIXSRC_WARP_EXCLUDES
-        ]
-        if filtered != values:
-            config[key] = filtered
-            changed = True
-    return changed
-
-
 def _load():
     global _config_data
     os.makedirs(_CONFIG_DIR, exist_ok=True)
@@ -94,16 +70,12 @@ def _load():
                         if item not in combined:
                             combined.append(item)
                     merged[list_key] = combined
-            config_changed = _remove_vixsrc_warp_excludes(merged)
             _config_data = merged
-            if config_changed:
-                _save()
             logger.debug("Loaded config from %s", _CONFIG_FILE)
             return
         except Exception as e:
             logger.warning("Failed to load config.json: %s", e)
     _config_data = dict(DEFAULT_CONFIG)
-    _remove_vixsrc_warp_excludes(_config_data)
     _save()
 
 
@@ -155,7 +127,6 @@ def replace_all(data: dict):
         _load()
     merged = dict(DEFAULT_CONFIG)
     merged.update(data)
-    _remove_vixsrc_warp_excludes(merged)
     with _lock:
         _config_data = merged
     _save()
