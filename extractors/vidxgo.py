@@ -272,6 +272,42 @@ class VidXgoExtractor:
             raise ExtractorError("VidXgo: extracted URL did not return a valid HLS manifest")
 
         captured_map: dict[str, str] = {m3u8_url: master_text}
+        if force_refresh:
+            # Segment recovery needs media playlists, not just the master.
+            from urllib.parse import urljoin
+
+            pending = [(m3u8_url, master_text)]
+            seen = {m3u8_url}
+            while pending and len(seen) < 16:
+                parent_url, manifest = pending.pop(0)
+                variant_next = False
+                for line in manifest.splitlines():
+                    line = line.strip()
+                    child = None
+                    if line.startswith("#EXT-X-STREAM-INF:"):
+                        variant_next = True
+                        continue
+                    if line.startswith("#EXT-X-MEDIA:"):
+                        match = re.search(r'URI="([^"]+)"', line)
+                        child = match.group(1) if match else None
+                    elif line and not line.startswith("#"):
+                        if variant_next:
+                            child = line
+                        variant_next = False
+                    if not child:
+                        continue
+                    child_url = urljoin(parent_url, child)
+                    if child_url in seen or len(seen) >= 16:
+                        continue
+                    seen.add(child_url)
+                    try:
+                        child_text = await self._fetch(child_url, playback_headers, bypass_warp=bypass_warp)
+                    except Exception as exc:
+                        logger.debug("VidXgo recovery playlist fetch failed: %s", exc)
+                        continue
+                    if "#EXTM3U" in child_text:
+                        captured_map[child_url] = child_text
+                        pending.append((child_url, child_text))
 
         result = {
             "destination_url": m3u8_url,
