@@ -10,6 +10,7 @@ import tarfile
 import zipfile
 import tempfile
 import services.proxy_shared as _shared
+from services import wg_tunnels
 from services.proxy_shared import (
     logger, web, APP_VERSION,
     check_password, get_client_ip, PlaylistBuilder, ClientSession, ClientTimeout,
@@ -1363,6 +1364,13 @@ class HLSProxyPagesMixin:
             from config import WARP_PROXY_URL
             if config_store.get("enable_warp", False):
                 routes.append({"name": "Via WARP", "proxy": WARP_PROXY_URL})
+            # Secondary WireGuard tunnels: only when their wireproxy is running.
+            for slot, label in (("nordvpn", "Via NordVPN"), ("custom", "Via Custom WireGuard")):
+                if wg_tunnels.process_running(slot):
+                    routes.append({
+                        "name": label,
+                        "proxy": f"socks5://{wg_tunnels.get_bind(slot)}",
+                    })
             global_proxies = config_store.get("global_proxies", [])
             if global_proxies:
                 routes.append({"name": "Via Proxy", "proxy": global_proxies[0]})

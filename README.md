@@ -61,6 +61,11 @@ Android users can also install the APK build if they prefer a simpler app-style 
 
 For Termux, full functionality requires a 64-bit Android device. On 32-bit devices, some components and solvers may not work.
 
+The setup also installs `wireproxy` (arm64/armv7) and the pinned WARP registration
+script inside the Ubuntu guest, so Cloudflare WARP and the NordVPN/custom WireGuard
+SOCKS5 tunnels work on Termux too. The first start registers WARP once and saves the
+profile in `/data/warp.conf`; `enable_warp` in the Admin Panel only controls routing.
+
 1.  **Install Termux** from [F-Droid](https://f-droid.org/en/packages/com.termux/) (do NOT use Play Store version).
 2.  **Run the One-Shot Setup**:
     ```bash
@@ -120,6 +125,24 @@ It requires no `NET_ADMIN`, privileged mode, `/dev/net/tun`, kernel module, or
 sysctl.
 
 You can enable and configure WARP, customize the excluded domains list, and enter your license key directly from the **Admin Panel**.
+
+### 🧭 NordVPN & custom WireGuard tunnels
+Besides WARP, EasyProxy can run up to two extra `wireproxy` userspace tunnels and
+expose them as plain local SOCKS5 proxies:
+
+| Panel | Profile source | Default SOCKS5 endpoint |
+| :--- | :--- | :--- |
+| `/admin/nordvpn` | NordLynx profile generated from your NordVPN access token and the server you pick | `socks5h://127.0.0.1:1081` |
+| `/admin/wireguard` | Any WireGuard profile pasted into the panel | `socks5h://127.0.0.1:1082` |
+
+WARP keeps `127.0.0.1:1080`; each tunnel has its own process, port, pid file and log,
+so they can run in parallel. Both bind addresses are editable in their panel.
+
+Reference the endpoint from **Global Proxies**, a **Transport Route** or an extractor
+proxy to route EasyProxy traffic through it. TCP only: the SOCKS5 endpoint cannot
+carry UDP. A missing `DNS`, `MTU` and `PersistentKeepalive` in a pasted profile is
+filled with `1.1.1.1`, `1420` and `25`; IPv6 entries and wg-quick-only directives
+(`Table`, `PostUp`, ...) are stripped before the tunnel starts.
 
 ### 🧩 VixSrc FlareSolverr
 The Docker image also contains FlareSolverr, Chromium, and Xvfb. FlareSolverr is

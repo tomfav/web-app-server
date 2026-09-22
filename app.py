@@ -17,8 +17,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from services.proxy import HLSProxy
 from config import PORT, RECORDINGS_DIR, APP_VERSION
 from services.dual import service as dual_service
+from services import wg_tunnels
 from services.recording_manager import RecordingManager
 from routes.recordings import setup_recording_routes
+from routes.wg_tunnels import setup_wg_tunnel_routes
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +138,8 @@ def create_app():
     app.router.add_post('/api/admin/speedtest', proxy.handle_admin_api_speedtest)
     # Setup recording/DVR routes
     setup_recording_routes(app, recording_manager)
+    # NordVPN / custom WireGuard SOCKS5 tunnels + their admin panels
+    setup_wg_tunnel_routes(app)
     
     # Gestore OPTIONS generico per CORS
     app.router.add_route('OPTIONS', '/{tail:.*}', proxy.handle_options)
@@ -147,6 +151,7 @@ def create_app():
     async def on_startup(app):
         asyncio.create_task(proxy.start_tasks())
         asyncio.create_task(recording_manager.cleanup_loop())
+        asyncio.create_task(wg_tunnels.keepalive_loop())
     app.on_startup.append(on_startup)
 
     async def on_shutdown(app):
