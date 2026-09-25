@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
     "wg_custom_config": "",
     "wg_custom_bind": "127.0.0.1:1082",
     "wg_custom_enabled": False,
+    "tor_bind": "127.0.0.1:9050",
+    "tor_enabled": False,
     "extractor_proxies": {},
     # Cinejoy's gateway rejects Cloudflare WARP egress (HTTP 403). Keep its
     # resolver direct unless the user explicitly supplies another proxy route.

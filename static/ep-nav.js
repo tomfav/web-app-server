@@ -9,6 +9,7 @@
         ],
         [
             {label: 'Admin', href: '/admin'},
+            {label: 'TorProxy', href: '/admin/torproxy'},
             {label: 'NordVPN', href: '/admin/nordvpn'},
             {label: 'Custom WireGuard', href: '/admin/wireguard'},
         ],

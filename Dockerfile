@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     jq \
     wireguard-tools \
+    tor \
     tar \
     nodejs \
     node-undici \

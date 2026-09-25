@@ -76,7 +76,7 @@ PersistentKeepalive = 25"></textarea>
         <div class="row">
             <button class="btn btn-primary btn-sm" id="btn-apply" onclick="applyConfig()">Apply profile</button>
             <button class="btn btn-sm" onclick="loadConfig()">Reload saved profile</button>
-            <button class="btn btn-sm" onclick="clearConfig()">Clear</button>
+            <button class="btn btn-danger btn-sm" onclick="clearConfig()">Delete saved profile</button>
         </div>
         <p class="hint">
             Needs <span class="mono">[Interface]</span> with PrivateKey and Address plus a <span class="mono">[Peer]</span> with
@@ -200,9 +200,15 @@ async function loadConfig() {
     } catch (error) { toast(error.message, 'error'); }
 }
 
-function clearConfig() {
-    document.getElementById('config').value = '';
-    configTouched = true;
+async function clearConfig() {
+    if (!confirm('Delete saved Custom WireGuard profile and stop its tunnel?')) return;
+    try {
+        await api('/api/admin/wg/custom/clear', {method: 'POST'});
+        document.getElementById('config').value = '';
+        configTouched = false;
+        toast('Saved profile deleted', 'success');
+        refresh();
+    } catch (error) { toast(error.message, 'error'); }
 }
 
 async function saveBind() {

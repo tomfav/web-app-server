@@ -126,17 +126,30 @@ sysctl.
 
 You can enable and configure WARP, customize the excluded domains list, and enter your license key directly from the **Admin Panel**.
 
-### 🧭 NordVPN & custom WireGuard tunnels
-Besides WARP, EasyProxy can run up to two extra `wireproxy` userspace tunnels and
-expose them as plain local SOCKS5 proxies:
+### 🧭 NordVPN, custom WireGuard & TorProxy
+Besides WARP, EasyProxy can run extra local SOCKS5 proxies:
 
 | Panel | Profile source | Default SOCKS5 endpoint |
 | :--- | :--- | :--- |
 | `/admin/nordvpn` | NordLynx profile generated from your NordVPN access token and the server you pick | `socks5h://127.0.0.1:1081` |
 | `/admin/wireguard` | Any WireGuard profile pasted into the panel | `socks5h://127.0.0.1:1082` |
+| `/admin/torproxy` | Tor client managed by EasyProxy | `socks5h://127.0.0.1:9050` |
 
-WARP keeps `127.0.0.1:1080`; each tunnel has its own process, port, pid file and log,
-so they can run in parallel. Both bind addresses are editable in their panel.
+WARP keeps `127.0.0.1:1080`; each tunnel has its own process, port and log,
+so they can run in parallel. Bind addresses are editable in their panels.
+
+Tor is installed in the Docker image and starts only after enabling it from
+`/admin/torproxy`. Automatic circuit rotation is disabled as far as Tor allows
+(30-day maximum circuit lifetime); use **Request new IP** for manual `NEWNYM`.
+An exit can still change after a failure or process restart. The panel includes
+start/stop, manual identity change, Tor egress check and logs. Tor is TCP-only
+and should normally be used on selected routes rather than as the default for
+all streaming traffic.
+
+In the Admin Panel speed test, **Direct** uses Ookla. Every proxy route uses a
+real SOCKS5/HTTP proxied TCP throughput test, shows the egress IP, and does not
+fall back to the direct connection. Proxy routes run one 10-second download and
+one 10-second upload sample.
 
 Reference the endpoint from **Global Proxies**, a **Transport Route** or an extractor
 proxy to route EasyProxy traffic through it. TCP only: the SOCKS5 endpoint cannot

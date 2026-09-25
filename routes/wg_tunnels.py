@@ -138,6 +138,18 @@ def setup_wg_tunnel_routes(app: web.Application) -> None:
             "tunnel": await wg_tunnels.slot_status("custom", with_probe=True),
         })
 
+    async def handle_custom_clear(request):
+        if not check_password(request):
+            return _unauthorized()
+        try:
+            await wg_tunnels.clear_custom_profile()
+        except wg_tunnels.TunnelError as exc:
+            return _json({"error": str(exc)}, status=400)
+        return _json({
+            "status": "cleared",
+            "tunnel": await wg_tunnels.slot_status("custom"),
+        })
+
     async def handle_disconnect(request):
         if not check_password(request):
             return _unauthorized()
@@ -192,6 +204,7 @@ def setup_wg_tunnel_routes(app: web.Application) -> None:
     app.router.add_get("/api/admin/wg/nordvpn/servers", handle_servers)
     app.router.add_post("/api/admin/wg/nordvpn/connect", handle_connect)
     app.router.add_post("/api/admin/wg/custom", handle_custom)
+    app.router.add_post("/api/admin/wg/custom/clear", handle_custom_clear)
     app.router.add_post("/api/admin/wg/{slot}/disconnect", handle_disconnect)
     app.router.add_post("/api/admin/wg/{slot}/reconnect", handle_reconnect)
     app.router.add_post("/api/admin/wg/{slot}/bind", handle_bind)

@@ -614,6 +614,22 @@ async def apply_custom_profile(text: str) -> dict:
     return profile_summary(profile)
 
 
+async def clear_custom_profile() -> None:
+    """Stop custom WireGuard and remove its saved profile."""
+    set_enabled("custom", False)
+    try:
+        await stop("custom")
+    except TunnelError as exc:
+        logger.warning("wireproxy stop for custom clear failed: %s", exc)
+    if process_running("custom"):
+        raise TunnelError("Custom WireGuard is still running; profile was not deleted")
+    config_store.update({"wg_custom_config": "", "wg_custom_enabled": False})
+    try:
+        os.remove(profile_path("custom"))
+    except FileNotFoundError:
+        pass
+
+
 def _require_available() -> None:
     if not available():
         raise TunnelError(
