@@ -539,39 +539,47 @@ class HLSProxyCoreMixin:
         Can be called on-demand (e.g. on page refresh).
         Uses its own temporary session to avoid resetting the shared session idle timer.
         """
-        now = time.monotonic()
-        if now - getattr(self, "_latest_version_checked_at", 0.0) < 3600.0:
-            return
-        # Set before I/O so simultaneous page/API requests cannot create
-        # duplicate GitHub sessions. Background task retries on next interval.
-        self._latest_version_checked_at = now
+        lock = getattr(self, "_latest_version_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._latest_version_lock = lock
 
-        try:
-            cache_buster = int(time.time())
-            url = f"https://raw.githubusercontent.com/realbestia1/EasyProxy/main/config.py?t={cache_buster}"
+        # Serialize foreground page loads and the background check. The old
+        # implementation marked the check as complete before doing I/O, so a
+        # page could render "Checking..." while another task was still fetching.
+        async with lock:
+            now = time.monotonic()
+            checked_at = getattr(self, "_latest_version_checked_at", 0.0)
+            if checked_at > 0.0 and now - checked_at < 3600.0:
+                if self.latest_version == "Checking...":
+                    self.latest_version = "Unknown"
+                return
 
-            connector = TCPConnector(limit=1, limit_per_host=1, keepalive_timeout=5)
-            timeout = ClientTimeout(total=5)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url, timeout=2) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
-                        if match:
-                            new_version = match.group(1)
-                            if self.latest_version != new_version:
-                                self.latest_version = new_version
-                                logger.info(f"🆕 Latest version updated: {self.latest_version}")
-                        else:
-                            if self.latest_version == "Checking...":
+            try:
+                cache_buster = int(time.time())
+                url = f"https://raw.githubusercontent.com/realbestia1/EasyProxy/main/config.py?t={cache_buster}"
+
+                connector = TCPConnector(limit=1, limit_per_host=1, keepalive_timeout=5)
+                timeout = ClientTimeout(total=5)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get(url, timeout=2) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+                            if match:
+                                new_version = match.group(1)
+                                if self.latest_version != new_version:
+                                    self.latest_version = new_version
+                                    logger.info(f"🆕 Latest version updated: {self.latest_version}")
+                            else:
                                 self.latest_version = "Unknown"
-                    else:
-                        if self.latest_version == "Checking...":
+                        else:
                             self.latest_version = "Error"
-        except Exception as e:
-            if self.latest_version == "Checking...":
+            except Exception as e:
                 self.latest_version = "Unknown"
-            logger.debug(f"Version check skipped or failed: {e}")
+                logger.debug(f"Version check skipped or failed: {e}")
+            finally:
+                self._latest_version_checked_at = time.monotonic()
 
     @staticmethod
     def _strip_fake_png_header_from_ts(content: bytes) -> bytes:
