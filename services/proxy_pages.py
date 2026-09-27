@@ -351,6 +351,7 @@ class HLSProxyPagesMixin:
                 "aes_key": "/key?key_url=https://server.com/key.bin",  # ✅ NUOVO
                 "playlist": "/playlist?url=http://example.com/playlist1.m3u8;http://example.com/playlist2.m3u8",
                 "custom_headers": "/proxy/hls/manifest.m3u8?d=<URL>&h_Authorization=Bearer%20token",
+                "forced_extractor": "/proxy/hls/manifest.m3u8?d=<URL>&host=vavoo&max_res=true",
                 "dual_hls": "/dual/manifest.m3u8?d=<Base64URL(JSON)> [&api_password=<PASSWORD>]",
             },
         }
@@ -598,6 +599,8 @@ class HLSProxyPagesMixin:
                         "description": "MediaFlow-compatible HLS proxy endpoint.",
                         "parameters": [
                             {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True, "description": "Destination manifest URL"},
+                            {"name": "host", "in": "query", "schema": {"type": "string"}, "description": "Force a specific extractor instead of auto-detection"},
+                            {"name": "max_res", "in": "query", "schema": {"type": "boolean"}, "description": "Serve only the highest video variant"},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
                         ],
                         "responses": {"200": {"description": "Proxied HLS manifest"}},
@@ -620,6 +623,8 @@ class HLSProxyPagesMixin:
                         "description": "Converts or relays MPEG-DASH/MPD streams through EasyProxy.",
                         "parameters": [
                             {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True, "description": "Destination MPD URL"},
+                            {"name": "host", "in": "query", "schema": {"type": "string"}, "description": "Force a specific extractor instead of auto-detection"},
+                            {"name": "max_res", "in": "query", "schema": {"type": "boolean"}, "description": "Serve only the highest video variant"},
                             {"name": "key_id", "in": "query", "schema": {"type": "string"}},
                             {"name": "key", "in": "query", "schema": {"type": "string"}},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
@@ -908,9 +913,15 @@ class HLSProxyPagesMixin:
                 "/record": {
                     "get": {
                         "summary": "Start recording via GET",
-                        "description": "Quick-start a recording from a URL query parameter.",
+                        "description": "Quick-start a recording from a URL query parameter and redirect to the live stream while recording.",
                         "parameters": [
                             {"name": "url", "in": "query", "schema": {"type": "string"}, "required": True},
+                            {"name": "name", "in": "query", "schema": {"type": "string"}},
+                            {"name": "duration", "in": "query", "schema": {"type": "integer"}, "description": "Recording duration in seconds"},
+                            {"name": "extractor", "in": "query", "schema": {"type": "string"}, "description": "Force a specific extractor instead of auto-detection"},
+                            {"name": "max_res", "in": "query", "schema": {"type": "boolean"}, "description": "Record only the highest video variant"},
+                            {"name": "key_id", "in": "query", "schema": {"type": "string"}, "description": "ClearKey key ID for DRM-protected streams"},
+                            {"name": "key", "in": "query", "schema": {"type": "string"}, "description": "ClearKey key for DRM-protected streams"},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
                         ],
                         "responses": {"200": {"description": "Recording started"}},
@@ -954,9 +965,16 @@ class HLSProxyPagesMixin:
                                 "application/json": {
                                     "schema": {
                                         "type": "object",
+                                        "required": ["url"],
                                         "properties": {
-                                            "url": {"type": "string"},
-                                            "stream_type": {"type": "string"},
+                                            "url": {"type": "string", "description": "Stream URL to record"},
+                                            "name": {"type": "string", "description": "Human-readable recording name"},
+                                            "duration": {"type": "integer", "description": "Recording duration in seconds"},
+                                            "extractor": {"type": "string", "description": "Force a specific extractor instead of auto-detection"},
+                                            "max_res": {"type": "boolean", "description": "Record only the highest video variant"},
+                                            "warp": {"type": "string", "enum": ["off"], "description": "Bypass WARP for this recording"},
+                                            "proxy": {"type": "string", "enum": ["off"], "description": "Bypass configured proxies for this recording"},
+                                            "disable_ssl": {"type": "string", "enum": ["1"], "description": "Disable SSL verification for this recording"},
                                         },
                                     }
                                 }
