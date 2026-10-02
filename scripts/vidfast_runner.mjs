@@ -327,6 +327,22 @@ function patchPlayerChunk(source) {
     "function c6(e,t){return e-=123,c2()[e]}",
     "function c6(e,t){return e-=123,c2()[e]}globalThis.__playerRoutePrefix=c6(185);globalThis.__playerRouteSegment=c6(449);globalThis.__playerCsrf=JSON.parse(c6(674))[\"X-Csrf-Token\"];",
   );
+  patched = patched.replace(
+    "cc._0x1105e5=cR,globalThis._0x1105e5=cc._0x1105e5",
+    "cc._0x1105e5=cR,globalThis.__playerInit=cR,globalThis._0x1105e5=cc._0x1105e5",
+  );
+  patched = patched.replace(
+    "cc._0x3512a5=cq,globalThis._0x3512a5=cc._0x3512a5",
+    "cc._0x3512a5=cq,globalThis.__playerDecrypt=cq,globalThis._0x3512a5=cc._0x3512a5",
+  );
+  patched = patched.replace(
+    'join("")}s9.from("xZ/aW~D6:U0_]EVA");',
+    'join("")}globalThis.__playerEncode=cr;s9.from("xZ/aW~D6:U0_]EVA");',
+  );
+  patched = patched.replace(
+    "function cE(e,t){return e-=232,cb()[e]}",
+    'function cE(e,t){return e-=232,cb()[e]}globalThis.__playerRoutePrefix=cE(634);globalThis.__playerRouteSegment=cE(506);globalThis.__playerCsrf=JSON.parse(\'{"X-Csrf-Token":"XmgpzuVhnNr2zwA1p4wmG4kVSwbwvwiy"}\')["X-Csrf-Token"];',
+  );
   return patched;
 }
 
@@ -435,6 +451,7 @@ async function resolve() {
   if (!active.length) throw new Error("VidFast returned no servers");
 
   const errors = [];
+  let bestFallback = null;
   for (const server of active.filter(item => item?.data)) {
     try {
       const endpoint = `${routePrefix}/${context.__playerRouteSegment}/${server.data}`.replace(/\/+/g, "/");
@@ -445,12 +462,31 @@ async function resolve() {
       const stream = decryptedStream[0];
       if (stream?.url?.startsWith("http")) {
         const manifest = await probeStreamManifest(stream.url);
+        const resolutions = [...manifest.matchAll(/RESOLUTION=(\d+)x(\d+)/gi)]
+          .map(match => ({ w: Number(match[1]), h: Number(match[2]) }))
+          .filter(r => Number.isFinite(r.w) && Number.isFinite(r.h));
+        const maxResolution = resolutions.length
+          ? Math.max(...resolutions.map(r => r.w >= 3800 ? 2160 : r.h))
+          : 0;
+
+        if (!bestFallback || maxResolution > bestFallback.maxResolution) {
+          bestFallback = {
+            result: {
+              url: stream.url,
+              headers: { "User-Agent": userAgent, Referer: pageUrl, Origin: pageOrigin },
+              server: server.name || "VidFast",
+            },
+            maxResolution,
+          };
+        }
+
         if (minimumStreamHeight > 0) {
-          const heights = [...manifest.matchAll(/RESOLUTION=\d+x(\d+)/gi)]
-            .map(match => Number(match[1]))
-            .filter(Number.isFinite);
-          if (!heights.some(height => height >= minimumAcceptedHeight)) {
-            throw new Error(`no HLS variant near ${minimumStreamHeight}p`);
+          const is4k = minimumStreamHeight >= 2160;
+          const hasTarget = resolutions.some(r =>
+            is4k ? (r.w >= 3800 || r.h >= 2140) : (r.h >= minimumStreamHeight - 16)
+          );
+          if (!hasTarget) {
+            throw new Error(`no HLS variant near ${minimumStreamHeight}p (highest is ${maxResolution}p)`);
           }
         }
         return { url: stream.url, headers: { "User-Agent": userAgent, Referer: pageUrl, Origin: pageOrigin }, server: server.name || "VidFast" };
@@ -460,6 +496,12 @@ async function resolve() {
       errors.push(`${server.name || "server"}: ${error.message}`);
     }
   }
+
+  if (bestFallback) {
+    log(`Falling back to best available server (${bestFallback.maxResolution}p) on ${bestFallback.result.server}`);
+    return bestFallback.result;
+  }
+
   throw new Error(errors.join("; ") || "VidFast has no usable server");
 }
 
