@@ -1416,6 +1416,62 @@ class HLSProxyPagesMixin:
             logger.error(f"Speedtest failed: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
+    async def handle_admin_api_test_extractors(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        from extractors.test_urls import REMOTE_TEST_URLS_URL
+
+        urls = {}
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=10)) as session:
+                async with session.get(REMOTE_TEST_URLS_URL) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"gist HTTP {resp.status}")
+                    remote = await resp.json(content_type=None)
+                    if not isinstance(remote, dict):
+                        raise RuntimeError("gist JSON is not an object")
+                    urls = {
+                        k: v for k, v in remote.items()
+                        if isinstance(v, str)
+                    }
+        except Exception as e:
+            logger.warning("Test URL gist fetch failed: %s", e)
+            return web.json_response(
+                {"error": f"Could not load test URLs from gist: {e}",
+                 "results": [], "skipped": []},
+                status=502,
+            )
+
+        headers = dict(request.headers)
+        configured = {k: u for k, u in urls.items() if u}
+        skipped = sorted(k for k, u in urls.items() if not u)
+        results = []
+        sem = asyncio.Semaphore(5)
+
+        async def _test(name, url):
+            async with sem:
+                entry = {"extractor": name, "url": url, "ok": False}
+                try:
+                    extractor = await self.get_extractor(url, headers, host=name)
+                    timeout = getattr(extractor, "REQUEST_TIMEOUT_TOTAL", 30)
+                    result = await asyncio.wait_for(
+                        extractor.extract(url), timeout=timeout
+                    )
+                    destination = (result or {}).get("destination_url") or ""
+                    entry["ok"] = bool(destination)
+                    entry["destination_url"] = destination
+                    if not destination:
+                        entry["error"] = "no destination_url"
+                except asyncio.TimeoutError:
+                    entry["error"] = "timeout"
+                except Exception as e:
+                    entry["error"] = f"{type(e).__name__}: {e}"[:300]
+                results.append(entry)
+
+        await asyncio.gather(*(_test(k, u) for k, u in configured.items()))
+        results.sort(key=lambda r: (r["ok"], r["extractor"]))
+        return web.json_response({"results": results, "skipped": skipped})
+
     def _ensure_speedtest_exe(self):
         import subprocess
         import os as _os

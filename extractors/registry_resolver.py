@@ -624,7 +624,7 @@ async def resolve_extractor(self, url: str, request_headers: dict, host: str = N
                 )
             return self.extractors[key]
         elif (
-            re.search(r'(/watch\.php\?.*id=\d+|/stream/stream-[\w-]+\.php)', urllib.parse.unquote(url)) is not None
+            re.search(r'(/watch\.php\?.*id=\d+|/(?:stream|cast|watch|plus|casting|player|hub)/stream-[\w-]+\.php)', urllib.parse.unquote(url)) is not None
         ):
             key = _cache_key("dlstreams", bypass_warp)
             proxy = get_proxy_for_url(
