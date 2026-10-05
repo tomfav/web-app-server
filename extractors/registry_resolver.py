@@ -791,7 +791,7 @@ async def resolve_extractor(self, url: str, request_headers: dict, host: str = N
                     request_headers, proxies=proxy_list, bypass_warp=bypass_warp
                 )
             return self.extractors[key]
-        elif "vidsonic.net/" in url.lower() and re.search(r"/e/[A-Za-z0-9]+", url, re.IGNORECASE):
+        elif any(d in url.lower() for d in ("vidsonic.net/", "vixeo.io/")) and re.search(r"/e/[A-Za-z0-9]+", url, re.IGNORECASE):
             key = _cache_key("vidsonic", bypass_warp)
             proxy = get_proxy_for_url("vidsonic", bypass_warp=bypass_warp)
             proxy_list = _build_proxy_list(proxy, "vidsonic")

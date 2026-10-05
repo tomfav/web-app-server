@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 import config_store
-from config import check_password
+from config import check_password, resolve_proxy_alias
 from services.proxy_shared import (
     BYPASS_PROXIES_CONTEXT,
     BYPASS_WARP_CONTEXT,
@@ -226,7 +226,11 @@ class HLSProxyDualMixin:
     def _routing(spec: dict) -> tuple[bool, bool, str | None]:
         raw_proxy = str(spec.get("proxy") or spec.get("proxy_url") or "").strip()
         proxy_off = raw_proxy.lower() == "off" or bool(spec.get("proxy_off"))
-        forced_proxy = None if proxy_off or not raw_proxy else urllib.parse.unquote(raw_proxy)
+        forced_proxy = (
+            None
+            if proxy_off or not raw_proxy
+            else resolve_proxy_alias(urllib.parse.unquote(raw_proxy))
+        )
         warp_off = str(spec.get("warp") or "").lower() == "off" or bool(spec.get("warp_off"))
         return warp_off, proxy_off, forced_proxy
 
