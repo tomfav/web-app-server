@@ -716,6 +716,12 @@ async function runAllSpeedtests() {
     }
 }
 
+const EXTRACTOR_LABELS = { f16px: 'F16Px / Byse' };
+
+function extractorLabel(name) {
+    return EXTRACTOR_LABELS[name] || name;
+}
+
 async function runExtractorTests() {
     const btn = document.getElementById('extractors-test-btn');
     if (btn.disabled) return;
@@ -735,11 +741,11 @@ async function runExtractorTests() {
                 ? ''
                 : '<div style="color:var(--accent-error);font-size:0.7rem;word-break:break-all">' + (r.error || 'failed').replace(/https?:\/\/\S+/g, '…') + '</div>';
             return '<div class="' + cls + '">' +
-                '<div style="font-weight:600;font-size:0.8rem;margin-bottom:4px">' + icon + ' ' + r.extractor + '</div>' +
+                '<div style="font-weight:600;font-size:0.8rem;margin-bottom:4px">' + icon + ' ' + extractorLabel(r.extractor) + '</div>' +
                 detail + '</div>';
         }).join('');
         const skipped = (data.skipped || []).length
-            ? '<div style="grid-column:1/-1;color:var(--text-muted);font-size:0.7rem">Skipped (no link): ' + data.skipped.join(', ') + '</div>'
+            ? '<div style="grid-column:1/-1;color:var(--text-muted);font-size:0.7rem">Skipped (no link): ' + data.skipped.map(extractorLabel).join(', ') + '</div>'
             : '';
         result.innerHTML = '<div>' + rows + skipped + '</div>';
     } catch (e) {

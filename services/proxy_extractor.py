@@ -140,6 +140,7 @@ class HLSProxyExtractorHandlerMixin:
                         "turbovidplay",
                         "livetv",
                         "f16px",
+                        "byse (alias of f16px)",
                         "guardabest",
                         "mediaset",
                         "wittytv",

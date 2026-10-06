@@ -274,7 +274,10 @@ async def resolve_extractor(self, url: str, request_headers: dict, host: str = N
                         request_headers, proxies=proxy_list
                     )
                 return self.extractors[key]
-            elif host == "f16px":
+            elif host in ["f16px", "byse"]:
+                key = _cache_key("f16px", bypass_warp)
+                proxy = get_proxy_for_url("f16px", bypass_warp=bypass_warp)
+                proxy_list = _build_proxy_list(proxy, "f16px")
                 if key not in self.extractors:
                     self.extractors[key] = F16PxExtractor(
                         request_headers, proxies=proxy_list
@@ -692,7 +695,7 @@ async def resolve_extractor(self, url: str, request_headers: dict, host: str = N
             # Always refresh request_headers so per-call h_* overrides are honored.
             self.extractors[key].request_headers = request_headers
             return self.extractors[key]
-        elif "dropload" in url:
+        elif "dropload" in url or "dr0pstream" in url.lower():
             key = _cache_key("dropload", bypass_warp)
             proxy = get_proxy_for_url(
                 "dropload", bypass_warp=bypass_warp)
