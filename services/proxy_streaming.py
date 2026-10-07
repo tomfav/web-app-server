@@ -1098,10 +1098,35 @@ class HLSProxyStreamingMixin:
 
                 if resp.status not in [200, 206]:
                     if resp.status == 403:
+                        # 1. Quick retry if it's a transient CDN error (e.g. Varnish cache miss with Retry-After on TikTok/live CDNs)
+                        if is_hls_segment_request:
+                            retry_after = resp.headers.get("Retry-After")
+                            x_cache = resp.headers.get("X-Cache", "")
+                            server_hdr = resp.headers.get("Server", "").lower()
+                            if retry_after is not None or "miss" in x_cache.lower() or "varnish" in server_hdr:
+                                for att in range(2):
+                                    await asyncio.sleep(0.5 * (att + 1))
+                                    try:
+                                        retry_target = yarl.URL(stream_url, encoded=True) if not is_special_cdn else urllib.parse.unquote(stream_url)
+                                        async with session.get(retry_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as quick_resp:
+                                            if quick_resp.status in (200, 206):
+                                                logger.info("✅ Transient CDN 403 resolved on retry %d for %s", att + 1, stream_url.split('/')[-1].split('?')[0])
+                                                q_body = await quick_resp.read()
+                                                q_headers = dict(quick_resp.headers)
+                                                q_headers["Access-Control-Allow-Origin"] = "*"
+                                                is_image = q_headers.get("content-type", "").startswith("image/") or q_body[:8] == b"\x89PNG\r\n\x1a\n"
+                                                if is_image or request.path.endswith(".ts") or stream_url.endswith(".ts"):
+                                                    q_body = await asyncio.to_thread(self._strip_fake_png_header_from_ts, q_body)
+                                                    set_response_header(q_headers, "Content-Type", "video/mp2t")
+                                                    set_response_header(q_headers, "Content-Length", str(len(q_body)))
+                                                return web.Response(body=q_body, status=quick_resp.status, headers=q_headers)
+                                    except Exception:
+                                        pass
+
                         rot_response = await retry_with_different_proxy()
                         if rot_response:
                             return rot_response
-                        # Last resort: re-extract to refresh signed CDN token (e.g. VidXgo)
+                        # Last resort: re-extract to refresh signed CDN token (e.g. VidXgo, DLStreams)
                         re_response = await self._reextract_and_retry_segment(
                             request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl
                         )
@@ -1125,11 +1150,13 @@ class HLSProxyStreamingMixin:
                                 status=retry_result["status"],
                                 headers=retry_headers,
                             )
-                    if resp.status == 403 and request.path.endswith("manifest.m3u8"):
-                        logger.debug(
-                            "Upstream 403 on manifest, skipping recovery (browser fallback disabled) [%s]",
-                            log_context(session_proxy or forced_proxy),
+                    if resp.status == 403 and ("manifest.m3u8" in request.path or "playlist" in request.path):
+                        re_manifest_resp = await self._reextract_and_retry_manifest(
+                            request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl, extractor_key, stream_key
                         )
+                        if re_manifest_resp:
+                            return re_manifest_resp
+
                     error_body = await resp.content.read(4096) or b""
                     routing = safe_log_route(session_proxy or forced_proxy)
                     logger.warning(
@@ -1638,6 +1665,74 @@ class HLSProxyStreamingMixin:
                 if not coalesce_future.done():
                     coalesce_future.set_result(None)
 
+    async def _reextract_and_retry_manifest(
+        self, request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl, extractor_key, stream_key
+    ):
+        """Re-extract the source on 403 when upstream manifest token has expired."""
+        orig_url = request.query.get("orig_url")
+        if not orig_url:
+            return None
+
+        # Prevent recursive re-extraction loop
+        if getattr(request, "_manifest_reextracted", False):
+            return None
+        request._manifest_reextracted = True
+
+        logger.info(
+            "🔄 [Manifest 403] Upstream manifest token expired, re-extracting %s",
+            orig_url,
+        )
+        try:
+            extractor = await self.get_extractor(orig_url, headers, bypass_warp=bypass_warp)
+            if not extractor:
+                return None
+
+            refreshed = await extractor.extract(
+                orig_url,
+                force_refresh=True,
+                request_headers=headers,
+                bypass_warp=bypass_warp,
+                proxy=forced_proxy,
+            )
+            if not refreshed or not refreshed.get("destination_url"):
+                return None
+
+            new_stream_url = refreshed["destination_url"]
+            new_headers = refreshed.get("request_headers") or headers
+            logger.info(
+                "✅ [Manifest Recovered] Re-extraction succeeded: %s -> %s",
+                stream_url[:60],
+                new_stream_url[:60],
+            )
+
+            # Update live CDN token for stream_key so segments get the fresh token
+            if stream_key:
+                old_base_dir = stream_url.rsplit("/", 1)[0] + "/"
+                new_base_dir = new_stream_url.rsplit("/", 1)[0] + "/"
+                new_qs = ""
+                if "?" in new_stream_url:
+                    new_qs = "?" + new_stream_url.split("?", 1)[1]
+                self._renewed_cdn_tokens[stream_key] = (old_base_dir, new_base_dir, new_qs)
+                self._renewed_cdn_token_atimes[stream_key] = time.time()
+                logger.info(
+                    "🔑 Updated CDN token for stream_key=%s via manifest refresh",
+                    stream_key[:8],
+                )
+
+            return await self._proxy_stream(
+                request,
+                new_stream_url,
+                new_headers,
+                bypass_warp=bypass_warp,
+                forced_proxy=forced_proxy,
+                force_direct=force_direct,
+                extractor_key=extractor_key,
+                stream_key=stream_key,
+            )
+        except Exception as exc:
+            logger.warning("Manifest re-extraction failed: %s", exc)
+            return None
+
     async def _reextract_and_retry_segment(
         self, request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl
     ):
@@ -1701,6 +1796,13 @@ class HLSProxyStreamingMixin:
             if fresh_url:
                 break
 
+        # Fallback: if fresh_url not in captured_manifests, but master_url has a new query string
+        # (e.g. for barecrop/assetrage / tokenized HLS where the query token refreshed)
+        if not fresh_url and master_url and "?" in master_url:
+            new_q = master_url.split("?", 1)[1]
+            fresh_url = stream_url.split("?", 1)[0] + "?" + new_q
+            logger.info("Re-extract: updated segment token from playlist URL for %s", seg_filename)
+
         if not fresh_url or fresh_url.rsplit("/", 1)[-1].split("?")[0] != seg_filename:
             logger.debug(
                 "Re-extract: could not locate %s in refreshed manifest [%s]",
@@ -1753,7 +1855,14 @@ class HLSProxyStreamingMixin:
                     )
                     return None
                 body = await fr_resp.read()
-                rh = {"Access-Control-Allow-Origin": "*", "Content-Type": "video/mp2t"}
+                is_image = fr_resp.headers.get("content-type", "").startswith("image/") or body[:8] == b"\x89PNG\r\n\x1a\n"
+                if is_image or request.path.endswith(".ts") or stream_url.endswith(".ts"):
+                    body = await asyncio.to_thread(self._strip_fake_png_header_from_ts, body)
+                rh = {
+                    "Access-Control-Allow-Origin": "*",
+                    "Content-Type": "video/mp2t",
+                    "Content-Length": str(len(body)),
+                }
                 logger.info(
                     "✅ Segment recovered via re-extract: %s [%s]",
                     seg_filename,

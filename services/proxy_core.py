@@ -898,6 +898,9 @@ class HLSProxyCoreMixin:
             )
             forced_proxy = None
 
+        # ponytail: proxy_exclude_domains drops even explicit ?proxy= (WARP exempt)
+        forced_proxy = _config.effective_forced_proxy(url, forced_proxy)
+
         # Stale proxy sessions cleanup (>60s idle, aligned with connector
         # keepalive_timeout). The WARP session stays pooled; reusable upstream
         # sockets avoid rebuilding SOCKS+TLS for every media request.
