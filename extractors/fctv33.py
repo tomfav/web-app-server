@@ -35,6 +35,37 @@ SPORT_SLUG_MAP = {
     "cycling": 15, "handball": 16,
 }
 
+# Marker embedded by the playlist generator (fctv33_omg_universal) in the *direct*
+# signed stream URL, as a URL fragment (never sent to the CDN, ignored by players):
+#   https://cdn.example/token-.../index.m3u8#fctv33&matchId=123&streamId=456&sportType=1&siteType=2001
+# It lets EasyProxy recognise a plain playlist entry as an FCTV33 stream and mint a
+# fresh token from its own egress IP, without a dedicated /extractor/... link.
+_MARKER_RE = re.compile(r'(?:#|%23)fctv33(?![a-z0-9])', re.IGNORECASE)
+
+
+def has_fctv33_marker(url: str) -> bool:
+    return bool(url) and bool(_MARKER_RE.search(str(url)))
+
+
+def parse_fctv33_marker(url: str) -> dict:
+    """Return {matchId, streamId, sportType, siteType} found in the #fctv33 fragment ({} if none)."""
+    raw = str(url or "")
+    m = _MARKER_RE.search(raw)
+    if not m:
+        return {}
+    frag = raw[m.start():]
+    frag = urllib.parse.unquote(frag)
+    if frag.startswith("#"):
+        frag = frag[1:]
+    qs = urllib.parse.parse_qs(frag.replace("fctv33", "", 1).lstrip("&;="), keep_blank_values=False)
+    out = {}
+    for key in ("matchId", "streamId", "sportType", "siteType"):
+        vals = qs.get(key) or qs.get(re.sub(r'(?<!^)([A-Z])', r'_\1', key).lower())
+        if vals and vals[0]:
+            out[key] = vals[0].strip()
+    return out
+
+
 _EVENT_PAGE_RE = re.compile(r'/([a-z-]+)/([a-z0-9-]+)-(\d+)/([^/?#]+)\.html', re.IGNORECASE)
 
 
@@ -244,6 +275,17 @@ def parse_fctv33_target(url: str, **kwargs) -> tuple[str, str, int, int]:
     site_type = kwargs.get("siteType") or kwargs.get("site_type")
 
     raw = str(url or "").strip()
+
+    # Direct signed URL carrying the #fctv33&matchId=..&streamId=.. marker.
+    marker = parse_fctv33_marker(raw)
+    if marker:
+        match_id = match_id or marker.get("matchId")
+        stream_id = stream_id or marker.get("streamId")
+        sport_type = sport_type or marker.get("sportType")
+        site_type = site_type or marker.get("siteType")
+        raw = _MARKER_RE.split(raw, 1)[0]
+        if match_id and stream_id:
+            raw = ""  # ids resolved, nothing else to parse (the CDN URL has none)
 
     if "?" in raw:
         path_part, query_part = raw.split("?", 1)
