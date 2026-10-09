@@ -862,7 +862,7 @@ async def resolve_extractor(self, url: str, request_headers: dict, host: str = N
                     request_headers, proxies=proxy_list, bypass_warp=bypass_warp
                 )
             return self.extractors[key]
-        elif "fctv33" in url.lower() or url.lower().startswith("fctv33://") or "tcdru136ovur.ru" in url.lower():
+        elif "fctv33" in url.lower() or url.lower().startswith("fctv33://") or "tcdru136ovur.ru" in url.lower() or "tcpwe138stya.ru" in url.lower():
             key = _cache_key("fctv33", bypass_warp)
             if Fctv33Extractor is None:
                 raise RuntimeError("Fctv33Extractor module not available")

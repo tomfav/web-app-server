@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import codecs
+import hashlib
 import json
 import logging
 import os
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 AES_KEY = b"a7981cc9eb2f4d19dcfea57b101ecd89"
 AES_IV = b"8017d3a8f1400d2f"
 
-DEFAULT_DATA_API_BASE = "https://apis-data10.tcdru136ovur.ru"
+DEFAULT_DATA_API_BASE = "https://apis-data10.tcpwe138stya.ru"
 DEFAULT_PLAYER_REFERER = "https://nadia01eo.tn76degree12ec3out.cfd/"
 DEFAULT_STREAM_DIGIT = "seth"
 SITE_URL = "https://www.fctv33hd.rest"
@@ -150,6 +152,99 @@ def build_signed_stream_url(obfuscated_url: str, session_token: str) -> str:
     path_with_token = f"/token-{token}{parsed.path}"
     query = f"?{parsed.query}" if parsed.query else ""
     return f"{parsed.scheme}://{parsed.netloc}{path_with_token}{query}"
+
+
+# Salt used for the _s2 segment signature. FCTV33 publishes it in the site config
+# (common:cdnSmartLink -> auth.salt). The extractor stores the fetched value here so
+# that the stateless signing helpers (used by the manifest rewriter and the proxy
+# streamer, which never see the extractor instance) sign with the live salt.
+DEFAULT_S2_SALT = "00"
+_current_s2_salt = DEFAULT_S2_SALT
+
+
+def set_current_s2_salt(salt) -> None:
+    """Update the shared _s2 salt (ignored when empty)."""
+    global _current_s2_salt
+    if salt is None or salt == "":
+        return
+    _current_s2_salt = str(salt)
+
+
+def get_current_s2_salt() -> str:
+    return _current_s2_salt
+
+
+def decode_rot13_b64(s: str, is_slice: bool = True) -> str:
+    """Decode FCTV33 obfuscated parameters (_ctump, _ctuph) via ROT13 and Base64."""
+    if not s:
+        return s
+    s2 = s[8:] if is_slice and len(s) > 8 else s
+    try:
+        rot = codecs.decode(s2, "rot_13")
+        return base64.b64decode(rot).decode("utf-8", errors="replace")
+    except Exception:
+        return s
+
+
+def sign_s2_token(url: str, salt: str | None = None) -> str:
+    """Sign segment URL with _s2 signature parameter required by FCTV33 TencentEdgeOne CDN."""
+    if salt is None:
+        salt = _current_s2_salt
+    try:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "_s2" in qs:
+            return url
+        ver = qs.get("_ver", [""])[0]
+        if not ver:
+            return url
+        filename = parsed.path.split("/")[-1]
+        payload = f"{filename},{ver},{salt}"
+        s2 = hashlib.md5(payload.encode("utf-8")).hexdigest()
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}_s2={s2}"
+    except Exception:
+        return url
+
+
+def resolve_fctv33_segment_url(url: str, geo_country: str = "IT", geo_continent: str = "EU", salt: str | None = None) -> str:
+    """Resolve FCTV33 segment URL (_ctump / _ctuph smart link) and append _s2 signature."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        ctump = qs.get("_ctump", [""])[0]
+        ctuph = qs.get("_ctuph", [""])[0]
+        if not ctump or not ctuph:
+            return sign_s2_token(url, salt=salt)
+
+        decoded_ctump = decode_rot13_b64(ctump)
+        decoded_ctuph = decode_rot13_b64(ctuph)
+
+        # Parse host entries: e.g. "EU-IT:cf@host1,EU:cf@host2,WW:cf@host3"
+        chosen_host = None
+        ww_host = None
+        items = decoded_ctump.split(",")
+        for item in items:
+            if ":" in item and "@" in item:
+                ccode, rest = item.split(":", 1)
+                _, host = rest.split("@", 1)
+                if ccode == f"{geo_continent}-{geo_country}" or ccode == geo_country:
+                    chosen_host = host
+                    break
+                elif ccode == geo_continent and not chosen_host:
+                    chosen_host = host
+                elif ccode == "WW":
+                    ww_host = host
+
+        target_host = chosen_host or ww_host or (items[0].split("@")[-1] if "@" in items[0] else None)
+        if not target_host:
+            return sign_s2_token(url, salt=salt)
+
+        target_url = f"https://{target_host}{decoded_ctuph}"
+        return sign_s2_token(target_url, salt=salt)
+    except Exception as e:
+        logger.warning(f"Failed to resolve FCTV33 segment URL: {e}")
+        return url
 
 
 def read_varint(buffer: bytes, offset: int = 0):
@@ -358,6 +453,7 @@ class Fctv33Extractor(BaseExtractor):
         self.data_api_base = os.getenv("FCTV_DATA_API", DEFAULT_DATA_API_BASE)
         self.player_referer = DEFAULT_PLAYER_REFERER
         self.stream_digit = DEFAULT_STREAM_DIGIT
+        self.salt = "00"
         self.geo = {"country": "IT", "continent": "EU"}
         self._params_ts = 0
         self._init_lock = asyncio.Lock()
@@ -420,6 +516,15 @@ class Fctv33Extractor(BaseExtractor):
                                 self.player_referer = f"https://{domain_list[0].rstrip('/')}/"
                                 logger.info(f"Fctv33Extractor: Updated stream_digit={digit}, referer={self.player_referer}")
                                 break
+                        try:
+                            smart_link = json.loads(cfg.get("common:cdnSmartLink", "{}"))
+                            auth_salt = smart_link.get("auth", {}).get("salt")
+                            if auth_salt:
+                                self.salt = auth_salt
+                                set_current_s2_salt(auth_salt)
+                                logger.info("Fctv33Extractor: Updated _s2 salt")
+                        except Exception:
+                            pass
                         self._params_ts = now
             except Exception as e:
                 logger.warning(f"Fctv33Extractor: Failed to refresh player params ({e}), using defaults")

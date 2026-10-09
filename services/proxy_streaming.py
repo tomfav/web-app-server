@@ -140,6 +140,32 @@ class HLSProxyStreamingMixin:
             self._segment_inflight = inflight
         return inflight
 
+    # --- Image-wrapped segment sniffing (act-green) ---
+    # NOTE: daddyliveplayer.st / dlive.sx serve some .ts segments with a PNG/WebP
+    # body (URL/content-type often lie). Sniff the magic bytes, never the URL.
+    _PNG_SIG = b"\x89PNG\r\n\x1a\n"
+    _IMAGE_URL_MARKERS = (".image", "tiktokcdn", "~tplv-")
+    _IMAGE_UNWRAP_MAX_BYTES = 25_000_000
+
+    @staticmethod
+    def _is_image_magic(data: bytes) -> bool:
+        """True if data starts with PNG signature or RIFF....WEBP."""
+        if not data:
+            return False
+        if data[:8] == HLSProxyStreamingMixin._PNG_SIG:
+            return True
+        return len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+    @classmethod
+    def _is_image_url(cls, url: str) -> bool:
+        low = (url or "").lower()
+        return any(marker in low for marker in cls._IMAGE_URL_MARKERS)
+
+    @staticmethod
+    def _is_valid_ts(data: bytes) -> bool:
+        """Unwrapped payload is usable only with a TS sync byte."""
+        return bool(data) and len(data) > 188 and data[0] == 0x47
+
     async def handle_ts_segment(self, request):
         """Gestisce richieste per segmenti .ts"""
         try:
@@ -272,6 +298,10 @@ class HLSProxyStreamingMixin:
             ) as probe:
                 if probe.status not in (200, 206):
                     raise _ParallelFallback(f"probe status {probe.status}")
+                if (probe.headers.get("Content-Type") or "").lower().startswith("image/"):
+                    # Image-wrapped segment: let the single-connection path
+                    # buffer + unwrap it instead of relaying PNG bytes as TS.
+                    raise _ParallelFallback("image content-type")
                 accept_ranges = (probe.headers.get("Accept-Ranges") or "").lower()
                 content_range = probe.headers.get("Content-Range") or ""
                 if "bytes" not in accept_ranges and not content_range:
@@ -331,9 +361,18 @@ class HLSProxyStreamingMixin:
                     ssl=not disable_ssl,
                     timeout=ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=60),
                 ) as r:
+                    # A CDN ignoring Range answers 200 with the FULL body:
+                    # writing it at an offset silently corrupts the segment
+                    # (green/black video, audio survives). Fail fast instead.
+                    if r.status != 206:
+                        raise _ParallelFallback(f"part {start}-{end} status {r.status}")
                     r.raise_for_status()
-                    chunk = await r.read()
-                    data[start:start + len(chunk)] = chunk
+                    part = await r.read()
+                    if len(part) != (end - start + 1):
+                        raise _ParallelFallback(
+                            f"part {start}-{end} short ({len(part)} bytes)"
+                        )
+                    data[start:start + len(part)] = part
             finally:
                 if s_proxy:
                     await s.close()
@@ -346,6 +385,30 @@ class HLSProxyStreamingMixin:
         if len(data) != total:
             raise _ParallelFallback(f"size mismatch {len(data)} != {total}")
 
+        # Safety net: content-type can lie. Never relay PNG/WEBP bytes as TS
+        # (silent green screen, no log). Unwrap here, drop if not a valid TS.
+        raw = bytes(data)
+        if self._is_image_magic(raw):
+            logger.warning(
+                "Sniffed image-wrapped segment for %s in parallel fetch (%d bytes) -> unwrap",
+                segment_name, len(raw),
+            )
+            unwrapped = await asyncio.to_thread(self._strip_fake_png_header_from_ts, raw)
+            if not self._is_valid_ts(unwrapped):
+                logger.warning(
+                    "Dropped non-video static image segment for %s (%d bytes, no TS sync byte)",
+                    segment_name, len(raw),
+                )
+                return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+            raw = unwrapped
+
+        if not self._is_valid_ts(raw):
+            # Not an image and no TS sync byte (error page, truncated part,
+            # wrong container): never relay it as video. The single-connection
+            # path below handles it (buffered sniff / 204 / proper error).
+            head = raw[:8].hex() if raw else "empty"
+            raise _ParallelFallback(f"assembled head {head} not TS")
+
         # 3) Stream the assembled segment to the client.
         response_headers = {}
         set_response_header(response_headers, "Content-Type", "video/mp2t")
@@ -355,10 +418,10 @@ class HLSProxyStreamingMixin:
         set_response_header(response_headers, "Access-Control-Allow-Headers", "Range, Content-Type")
         response = web.StreamResponse(status=200, headers=response_headers)
         await response.prepare(request)
-        for i in range(0, len(data), 65536):
-            await response.write(bytes(data[i:i+65536]))
+        for i in range(0, len(raw), 65536):
+            await response.write(bytes(raw[i:i+65536]))
         await response.write_eof()
-        logger.info(f"⚡ Parallel fetch {segment_name}: {total} bytes via {K} ranges")
+        logger.info(f"⚡ Parallel fetch {segment_name}: {len(raw)} bytes via {K} ranges")
         return response
 
     async def _proxy_segment(self, request, segment_url, stream_headers, segment_name):
@@ -551,15 +614,96 @@ class HLSProxyStreamingMixin:
                     "Range, Content-Type",
                 )
 
+                # Image-wrapped segments need the full body to be unwrapped, so
+                # they must never take the chunk-by-chunk streaming path.
+                # Sniff the MAGIC bytes, not just URL/content-type: 861 proved
+                # upstream can serve PNG bytes as video/mp2t with a plain .ts URL.
+                is_upstream_image = (
+                    resp.headers.get("content-type", "").lower().startswith("image/")
+                    or self._is_image_url(segment_url)
+                )
+                if is_upstream_image:
+                    content_bytes = await resp.read()
+                    if len(content_bytes) > self._IMAGE_UNWRAP_MAX_BYTES:
+                        logger.warning(
+                            "Oversize image segment for %s (%d bytes), skipping",
+                            segment_name, len(content_bytes),
+                        )
+                        return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+                    if not self._is_image_magic(content_bytes):
+                        # False positive of the URL heuristic: plain TS with a
+                        # weird URL. Forward untouched, never unwrap garbage.
+                        return web.Response(body=content_bytes, status=resp.status, headers=response_headers)
+                    unwrapped = await asyncio.to_thread(self._strip_fake_png_header_from_ts, content_bytes)
+                    if self._is_valid_ts(unwrapped):
+                        set_response_header(response_headers, "Content-Type", "video/mp2t")
+                        set_response_header(response_headers, "Content-Length", str(len(unwrapped)))
+                        response_headers.pop("content-range", None)
+                        response_headers.pop("Content-Range", None)
+                        response_headers.pop("accept-ranges", None)
+                        response_headers.pop("Accept-Ranges", None)
+                        # Full buffered body: always 200. Echoing an upstream 206
+                        # without Content-Range is malformed and stalls ffmpeg.
+                        return web.Response(body=unwrapped, status=200, headers=response_headers)
+                    # Unwrap failed or not a TS: static ad/placeholder banner,
+                    # or corrupt payload. NEVER forward it as video (green screen).
+                    logger.warning(
+                        "Dropped non-video static image segment for %s (%d bytes, no TS sync byte)",
+                        segment_name, len(content_bytes)
+                    )
+                    return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+
+                # Peek the first chunk BEFORE prepare(): if the magic says image
+                # (heuristic above missed it), buffer the whole body and unwrap.
+                # The old code stripped only the first chunk and forwarded PNG
+                # bytes as video/mp2t in silence -> green screen on VLC+APTV.
+                stream_iter = resp.content.iter_any()
+                try:
+                    first_chunk = await stream_iter.__anext__()
+                except StopAsyncIteration:
+                    first_chunk = b""
+                if first_chunk and self._is_image_magic(first_chunk):
+                    logger.warning(
+                        "Sniffed image-wrapped segment for %s (ct=%s) -> buffered unwrap",
+                        segment_name, resp.headers.get("content-type", "?"),
+                    )
+                    buf = bytearray(first_chunk)
+                    async for chunk in stream_iter:
+                        buf += chunk
+                        if len(buf) > self._IMAGE_UNWRAP_MAX_BYTES:
+                            logger.warning(
+                                "Oversize image segment for %s (%d bytes), skipping",
+                                segment_name, len(buf),
+                            )
+                            return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+                    content_bytes = bytes(buf)
+                    unwrapped = await asyncio.to_thread(self._strip_fake_png_header_from_ts, content_bytes)
+                    if self._is_valid_ts(unwrapped):
+                        set_response_header(response_headers, "Content-Type", "video/mp2t")
+                        set_response_header(response_headers, "Content-Length", str(len(unwrapped)))
+                        response_headers.pop("content-range", None)
+                        response_headers.pop("Content-Range", None)
+                        response_headers.pop("accept-ranges", None)
+                        response_headers.pop("Accept-Ranges", None)
+                        # Full buffered body: always 200. Echoing an upstream 206
+                        # without Content-Range is malformed and stalls ffmpeg.
+                        return web.Response(body=unwrapped, status=200, headers=response_headers)
+                    logger.warning(
+                        "Dropped non-video static image segment for %s (%d bytes, no TS sync byte)",
+                        segment_name, len(content_bytes)
+                    )
+                    return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+
                 response = web.StreamResponse(status=resp.status, headers=response_headers)
                 await response.prepare(request)
 
-                first_chunk = True
                 try:
-                    async for chunk in resp.content.iter_any():
-                        if first_chunk:
-                            chunk = self._strip_fake_png_header_from_ts(chunk)
-                            first_chunk = False
+                    # Pure relay: at this point magic says NOT image, so no
+                    # strip/unwrap here (the old partial first-chunk strip could
+                    # not unwrap 7MB PNGs and forwarded them as video).
+                    if first_chunk:
+                        await self._write_with_backpressure(response, first_chunk)
+                    async for chunk in stream_iter:
                         await self._write_with_backpressure(response, chunk)
                     await response.write_eof()
                     return response
@@ -674,6 +818,14 @@ class HLSProxyStreamingMixin:
             for k in stale_tok:
                 self._renewed_cdn_tokens.pop(k, None)
                 self._renewed_cdn_token_atimes.pop(k, None)
+
+            # FCTV33: resolve smart link segment and ensure _s2 signature
+            if ("_ctump=" in stream_url and "_ctuph=" in stream_url) or (extractor_key == "fctv33" and "_ver=" in stream_url and "_s2=" not in stream_url):
+                try:
+                    from extractors.fctv33 import resolve_fctv33_segment_url
+                    stream_url = resolve_fctv33_segment_url(stream_url)
+                except Exception as _fctv_err:
+                    logger.debug("Failed to resolve FCTV33 segment in _proxy_stream: %s", _fctv_err)
 
             headers = dict(stream_headers)
 
@@ -1184,11 +1336,60 @@ class HLSProxyStreamingMixin:
                 )
                 # Image-wrapped segments need the full body to be unwrapped, so
                 # they must not take the chunk-by-chunk streaming path.
-                is_image_payload = content_type.startswith("image/")
+                # (Magic sniffed again on the body below; here headers+URL only.)
+                is_image_payload = (
+                    content_type.startswith("image/")
+                    or self._is_image_url(stream_url)
+                )
 
                 if (is_direct_media_stream or is_segment_like) and not is_image_payload:
                     stream_ext = os.path.splitext(stream_url.split("?", 1)[0].lower())[1]
                     is_fmp4_segment = stream_ext in {".m4s", ".mp4", ".m4a", ".m4v", ".m4i"}
+                    # fMP4 has its own init box: never treat it as image-wrapped.
+                    if is_segment_like and not is_fmp4_segment:
+                        peek_iter = resp.content.iter_any()
+                        try:
+                            peek_first = await peek_iter.__anext__()
+                        except StopAsyncIteration:
+                            peek_first = b""
+                        if peek_first and self._is_image_magic(peek_first):
+                            # Same case as 861: PNG bytes with a plain .ts URL.
+                            # Buffer + unwrap instead of relaying PNG as video.
+                            logger.warning(
+                                "Sniffed image-wrapped segment for %s (ct=%s) -> buffered unwrap",
+                                stream_url.split("/")[-1].split("?")[0][:80], content_type or "?",
+                            )
+                            buf = bytearray(peek_first)
+                            async for chunk in peek_iter:
+                                buf += chunk
+                                if len(buf) > self._IMAGE_UNWRAP_MAX_BYTES:
+                                    logger.warning(
+                                        "Oversize image segment (%d bytes), skipping [%s]",
+                                        len(buf), stream_url.split("/")[-1].split("?")[0][:80],
+                                    )
+                                    return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+                            img_bytes = bytes(buf)
+                            unwrapped = await asyncio.to_thread(self._strip_fake_png_header_from_ts, img_bytes)
+                            if self._is_valid_ts(unwrapped):
+                                img_headers = {
+                                    "Content-Type": "video/mp2t",
+                                    "Content-Length": str(len(unwrapped)),
+                                    "Access-Control-Allow-Origin": "*",
+                                    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                                    "Access-Control-Allow-Headers": "Range, Content-Type",
+                                }
+                                if coalesce_future is not None and resp.status == 200:
+                                    coalesce_future.set_result((unwrapped, dict(img_headers)))
+                                # Full buffered body: always 200, never echo 206.
+                                return web.Response(body=unwrapped, status=200, headers=img_headers)
+                            logger.warning(
+                                "Dropped non-video static image segment (%d bytes, no TS sync byte) [%s]",
+                                len(img_bytes), stream_url[:100],
+                            )
+                            return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+                    else:
+                        peek_iter = None
+                        peek_first = b""
                     requested_media_type = request.query.get("media_type", "").lower()
                     seg_content_type = (
                         "audio/mp4"
@@ -1211,12 +1412,18 @@ class HLSProxyStreamingMixin:
                     response = web.StreamResponse(status=resp.status, headers=response_headers)
                     await response.prepare(request)
                     try:
-                        first_chunk = True
-                        async for chunk in resp.content.iter_any():
-                            if first_chunk and is_segment_like:
-                                chunk = self._strip_fake_png_header_from_ts(chunk)
-                                first_chunk = False
-                            await self._write_with_backpressure(response, chunk)
+                        # Pure relay. Image-magic already diverted to buffered
+                        # unwrap above, so no strip here: the old partial
+                        # first-chunk strip could not unwrap 7MB PNGs and
+                        # forwarded them as video (silent green screen).
+                        if peek_iter is not None:
+                            if peek_first:
+                                await self._write_with_backpressure(response, peek_first)
+                            async for chunk in peek_iter:
+                                await self._write_with_backpressure(response, chunk)
+                        else:
+                            async for chunk in resp.content.iter_any():
+                                await self._write_with_backpressure(response, chunk)
                         await response.write_eof()
                         return response
                     except (ClientPayloadError, ConnectionResetError, OSError) as e:
@@ -1496,6 +1703,15 @@ class HLSProxyStreamingMixin:
                     response_headers.pop("Content-Range", None)
                     response_headers.pop("accept-ranges", None)
                     response_headers.pop("Accept-Ranges", None)
+                elif is_wrapped_image_segment:
+                    # An image segment was received, but no valid TS could be unwrapped (static ad/placeholder banner)
+                    if content_bytes[:8] == b"\x89PNG\r\n\x1a\n" or (content_bytes[:4] == b"RIFF" and content_bytes[8:12] == b"WEBP"):
+                        logger.warning(
+                            "Dropped non-video static image segment (%d bytes, no TS sync byte) [%s]",
+                            len(content_bytes),
+                            stream_url[:100],
+                        )
+                        return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
 
                 set_response_header(
                     response_headers, "Access-Control-Allow-Origin", "*"

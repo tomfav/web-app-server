@@ -837,12 +837,19 @@ class ManifestRewriter:
                     base_query,
                 )
 
-                encoded_url = urllib.parse.quote(absolute_url, safe="")
-
                 # Variant URIs after #EXT-X-STREAM-INF are playlists even when
                 # providers like VixSrc expose them as extensionless /playlist URLs.
                 is_manifest_uri = next_uri_is_manifest or ".m3u8" in absolute_url
                 next_uri_is_manifest = False
+
+                if not is_manifest_uri and (extractor_key == "fctv33" or ("_ctump=" in absolute_url and "_ctuph=" in absolute_url)):
+                    try:
+                        from extractors.fctv33 import resolve_fctv33_segment_url
+                        absolute_url = resolve_fctv33_segment_url(absolute_url)
+                    except Exception as _fctv_err:
+                        logger.debug("Failed to resolve FCTV33 segment in manifest: %s", _fctv_err)
+
+                encoded_url = urllib.parse.quote(absolute_url, safe="")
 
                 # Se e manifest usa /proxy/hls/manifest.m3u8, altrimenti determina estensione
                 if is_manifest_uri:

@@ -233,10 +233,19 @@ class DLStreamsExtractor(BaseExtractor):
                 f"{origin}/hub/stream-{channel_id}.php",
             ]
         # Default: prioritize Player 2 (/cast/) because it provides clean native MPEG-TS (.ts)
-        # without the heavy (7MB+) PNG-wrapped TikTok CDN overhead and frequent 403s of Player 1
+        # without the heavy (7MB+) PNG-wrapped TikTok CDN overhead and frequent 403s of Player 1.
+        # Exception: 861 always tries Player 1 first, even when its Player 2 looks
+        # online in a browser. That backend serves a technically valid stream (HTTP 200,
+        # valid MPEG-TS container, advancing timestamps, decodable-looking frames) whose
+        # video track is unplayable, so every cheap liveness probe promotes it while
+        # playback shows green/black with working audio. The failure only surfaces at
+        # decode time, which no proxy-side check can afford to replicate -- every
+        # simpler approach was tried and discarded, this pin is the fix.
+        first = "stream" if channel_id == "861" else "cast"
+        second = "cast" if channel_id == "861" else "stream"
         return [
-            f"{origin}/cast/stream-{channel_id}.php",
-            f"{origin}/stream/stream-{channel_id}.php",
+            f"{origin}/{first}/stream-{channel_id}.php",
+            f"{origin}/{second}/stream-{channel_id}.php",
             f"{origin}/watch/stream-{channel_id}.php",
             f"{origin}/plus/stream-{channel_id}.php",
             f"{origin}/casting/stream-{channel_id}.php",
@@ -271,13 +280,81 @@ class DLStreamsExtractor(BaseExtractor):
                 return cls._inherit_query_if_missing(urljoin(base_url, line), base_url)
         return None
 
-    async def _is_stream_alive(self, session, stream_url: str, headers: dict, budget: float | None = None) -> bool:
+    @staticmethod
+    def _segment_looks_like_image(segment_url: str, content_type: str, head: bytes) -> bool:
+        """True when a segment is (or may be) an image container instead of raw TS."""
+        if head[:1] == b"\x47":
+            return False  # already clean MPEG-TS
+        if head.startswith(b"\x89PNG\r\n\x1a\n") or (head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
+            return True
+        low = (segment_url or "").lower()
+        return (
+            (content_type or "").startswith("image/")
+            or ".image" in low
+            or "tiktokcdn" in low
+            or "~tplv-" in low
+        )
+
+    async def _image_segment_carries_ts(
+        self, session, segment_url: str, headers: dict, budget: float | None = None
+    ) -> bool:
+        """Download an image-wrapped segment and check that a real MPEG-TS can be unwrapped.
+
+        Mirrors the proxy: only segments that unwrap to TS are served, anything else
+        (static banner / placeholder) is dropped with HTTP 204. Returns False only when
+        that is definitively the case; network errors/timeouts/oversize are inconclusive
+        and return True so a slow link does not discard a working player.
+        """
+        try:
+            from services.proxy_core import HLSProxyCoreMixin
+        except Exception as e:
+            logger.debug("DLStreams: cannot import unwrapper, skipping deep check: %s", e)
+            return True
+
+        max_bytes = 16 * 1024 * 1024
+        total = 12.0 if budget is None else max(2.0, min(12.0, budget))
+        body = bytearray()
+        try:
+            async with session.get(
+                segment_url, headers=headers, timeout=ClientTimeout(total=total)
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                async for chunk in resp.content.iter_chunked(65536):
+                    body.extend(chunk)
+                    if len(body) > max_bytes:
+                        logger.debug("DLStreams: image segment above %d bytes, deep check inconclusive", max_bytes)
+                        return True
+        except Exception as e:
+            logger.debug("DLStreams: deep segment check inconclusive for %s: %s", segment_url, e)
+            return True
+
+        data = bytes(body)
+        if not data:
+            return False
+        try:
+            unwrapped = await asyncio.to_thread(
+                HLSProxyCoreMixin._strip_fake_png_header_from_ts, data
+            )
+        except Exception as e:
+            logger.debug("DLStreams: unwrap failed for %s: %s", segment_url, e)
+            return False
+        return bool(unwrapped) and len(unwrapped) > 188 and unwrapped[0] == 0x47
+
+    async def _is_stream_alive(self, session, stream_url: str, headers: dict, budget: float | None = None, deep: bool = True) -> bool:
         """Validate the full chain: master -> variant -> first segment (+ AES key).
 
         Some CDNs serve the manifest (200) while segments 403 (IP-bound
         tokens, datacenter blocks). A manifest-only check would accept a
         dead player and hide the working ones, so follow the chain with
         cheap probes (first bytes of the first segment only).
+
+        With ``deep=True`` an image-wrapped segment (PNG/WebP, e.g. Player 1) is
+        downloaded once and unwrapped exactly like the proxy does when serving it:
+        if no MPEG-TS can be recovered (static banner/placeholder image, which the
+        proxy would answer with HTTP 204) the player is reported dead so the caller
+        moves on to the next player. ``deep=False`` keeps the cheap check only
+        (used for the quick stale-cache probe).
         """
         def _timeout(default: float) -> float:
             if budget is None:
@@ -314,14 +391,26 @@ class DLStreamsExtractor(BaseExtractor):
                 logger.debug("DLStreams: validation of %s -> no segments listed", stream_url)
                 return False
             probe_headers = {**headers, "Range": "bytes=0-1023"}
+            seg_ctype = ""
+            seg_head = b""
             async with session.get(segment, headers=probe_headers, timeout=_timeout(8)) as resp:
                 if resp.status not in (200, 206):
                     logger.debug("DLStreams: segment probe of %s -> HTTP %s", segment, resp.status)
                     return False
+                seg_ctype = (resp.headers.get("Content-Type") or "").lower()
                 try:
-                    await resp.content.read(4096)
+                    seg_head = await resp.content.read(4096)
                 except Exception:
                     pass
+            if deep and self._segment_looks_like_image(segment, seg_ctype, seg_head):
+                if not await self._image_segment_carries_ts(
+                    session, segment, headers, budget=budget
+                ):
+                    logger.info(
+                        "DLStreams: segment %s is an image with no MPEG-TS payload, treating player as dead",
+                        segment,
+                    )
+                    return False
             # AES key, if the variant uses one
             key_match = re.search(r'#EXT-X-KEY:[^\n]*URI="([^"]+)"', current_body)
             if key_match:
@@ -612,7 +701,8 @@ class DLStreamsExtractor(BaseExtractor):
         self._sync_entry_origin_from_url(url)
         self._apply_routing_kwargs(url, kwargs)
         channel_id = self._extract_channel_id(url)
-        channel_key = (f"premium{channel_id}", self._forced_proxy, self._force_direct, self.bypass_warp_active)
+        req_mode = "stream" if "/stream/stream-" in url.lower() else "default"
+        channel_key = (f"premium{channel_id}", req_mode, self._forced_proxy, self._force_direct, self.bypass_warp_active)
 
         cached = self._stream_cache.get(channel_key)
         if cached and cached[0] > time.monotonic():
@@ -688,7 +778,7 @@ class DLStreamsExtractor(BaseExtractor):
                 return False
             headers = (cached_result or {}).get("request_headers", {}) or {}
             session = await self._get_session(stream_url)
-            return await self._is_stream_alive(session, stream_url, headers, budget=4.0)
+            return await self._is_stream_alive(session, stream_url, headers, budget=4.0, deep=False)
         except Exception:
             return False
 
