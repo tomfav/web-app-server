@@ -787,6 +787,7 @@ class DLStreamsExtractor(BaseExtractor):
             session = await self._get_session(url)
 
             # Direct browser-less HTTP extraction (only active path)
+            direct_error = None
             try:
                 logger.info("DLStreams: Attempting direct browser-less HTTP extraction for %s", f"premium{channel_id}")
                 direct_result = await self._extract_directly(url, channel_id)
@@ -794,6 +795,7 @@ class DLStreamsExtractor(BaseExtractor):
                     logger.info("DLStreams: Direct browser-less extraction succeeded for %s!", f"premium{channel_id}")
                     return direct_result
             except Exception as direct_exc:
+                direct_error = direct_exc
                 logger.debug(
                     "DLStreams: browser-less extraction failed for %s: %s",
                     f"premium{channel_id}",
@@ -801,7 +803,7 @@ class DLStreamsExtractor(BaseExtractor):
                     exc_info=True,
                 )
 
-            raise ExtractorError("Could not retrieve manifest via browser-less extraction (browser fallback is disabled).")
+            raise ExtractorError("Could not retrieve manifest via extraction.") from direct_error
 
         except asyncio.CancelledError:
             raise
